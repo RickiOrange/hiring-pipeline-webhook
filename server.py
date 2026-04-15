@@ -21,8 +21,7 @@ import os
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Header, Request
 
 from pipeline import load_config, process_single_stage1
 
@@ -59,14 +58,6 @@ def verify_secret(provided: str | None):
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
 
-# --- Request models ---
-
-class WebhookPayload(BaseModel):
-    page_id: str | None = None
-    source: str | None = None
-    data: dict | None = None
-
-
 # --- Endpoints ---
 
 @app.get("/health")
@@ -78,29 +69,64 @@ async def health():
     }
 
 
+def _extract_page_id(body: dict) -> str | None:
+    """Extract page_id from various webhook payload formats.
+
+    Supports:
+      - {"page_id": "abc123"}                         (direct)
+      - {"data": {"page_id": "abc123"}}               (nested)
+      - {"id": "abc123-..."}                           (Notion native)
+      - {"data": [{"id": "abc123", ...}]}              (Notion automation array)
+      - {"properties": {...}, "id": "..."}             (Notion page object)
+    """
+    # Direct page_id field
+    if body.get("page_id"):
+        return body["page_id"]
+
+    # Nested under data dict
+    data = body.get("data")
+    if isinstance(data, dict) and data.get("page_id"):
+        return data["page_id"]
+
+    # Notion native: top-level id field
+    if body.get("id"):
+        return body["id"]
+
+    # Notion automation sends array of page objects
+    if isinstance(data, list) and len(data) > 0:
+        first = data[0]
+        if isinstance(first, dict) and first.get("id"):
+            return first["id"]
+
+    # Nested under data dict: id field
+    if isinstance(data, dict) and data.get("id"):
+        return data["id"]
+
+    return None
+
+
 @app.post("/webhook/stage1")
 async def webhook_stage1(
-    payload: WebhookPayload,
+    request: Request,
     x_webhook_secret: str | None = Header(None),
 ):
     """Process a single candidate through Stage 1.
 
-    Accepts either:
-      {"page_id": "abc123"}
-    or (from Notion automations):
-      {"data": {"page_id": "abc123"}}
+    Accepts Notion automation webhooks and direct POST requests.
+    Flexibly extracts page_id from multiple payload formats.
     """
     verify_secret(x_webhook_secret)
 
-    # Extract page_id from either payload format
-    page_id = payload.page_id or (payload.data or {}).get("page_id")
+    body = await request.json()
+    logger.info(f"Webhook payload received: {body}")
+
+    page_id = _extract_page_id(body)
     if not page_id:
-        raise HTTPException(status_code=400, detail="No page_id provided")
+        logger.error(f"Could not extract page_id from payload: {body}")
+        raise HTTPException(status_code=400, detail="No page_id found in payload")
 
-    # Normalize: strip hyphens if present (Notion API accepts both)
     page_id = page_id.strip()
-
-    logger.info(f"Webhook received for page_id: {page_id}")
+    logger.info(f"Processing page_id: {page_id}")
 
     # Run the sync pipeline code in a thread to avoid blocking the event loop
     try:
