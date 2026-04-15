@@ -1,0 +1,51 @@
+role_name: "Business Development Lead"
+notion_database_id: "336eddaa-d74c-8188-b616-c32aa4da025e"
+notion_prompts_page_id: "336eddaa-d74c-814e-90f6-db7f3f5d98d6"
+
+thresholds:
+  stage1_pass: 60       # scored out of 100 (no manual review)
+  stage2_pass: 12       # scored out of 20
+  stage3_pass: 22       # scored out of 35
+  stage4_pass: 15       # scored out of 25
+  stage5_pass: 4        # scored out of 6
+
+# For composite ranking, normalize all scores to 0-100
+# Stage 5 is a gate (must pass) but not weighted
+composite_weights:
+  stage1: 0.10
+  stage2: 0.15
+  stage3: 0.25
+  stage4: 0.15
+  stage5: 0.0
+  interview: 0.35
+
+# Max scores per stage (for normalization to 0-100)
+max_scores:
+  stage1: 100
+  stage2: 20
+  stage3: 35
+  stage4: 25
+  stage5: 6
+
+min_finalists: 5
+
+timeout:
+  warning_days: 5
+  expiry_days: 7
+
+stages:
+  applied: "Applied"
+  stage2_task: "Stage 2 Task"
+  stage3_task: "Stage 3 Task"
+  stage4_task: "Stage 4 Task"
+  stage5_task: "Stage 5 Task"
+  final_interview: "Final Interview"
+  hired: "Hired"
+  rejected: "Rejected"
+
+# Hard filters for Stage 1 pre-screening (auto-reject before AI)
+hard_filters:
+  require_degree: true
+  max_age_range: "41-45"  # reject 46-50 and Over 50
+  min_experience: "3-5"   # reject 0-2
+  require_executive_or_closing: true  # must have Executive Sales OR Closed Deals Over R1M
