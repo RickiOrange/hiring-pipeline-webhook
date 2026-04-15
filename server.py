@@ -106,16 +106,19 @@ def _extract_page_id(body: dict) -> str | None:
 
 
 @app.post("/webhook/stage1")
-async def webhook_stage1(
-    request: Request,
-    x_webhook_secret: str | None = Header(None),
-):
+async def webhook_stage1(request: Request):
     """Process a single candidate through Stage 1.
 
     Accepts Notion automation webhooks and direct POST requests.
     Flexibly extracts page_id from multiple payload formats.
     """
-    verify_secret(x_webhook_secret)
+    # Check for webhook secret in multiple header variations
+    # Notion sends underscored keys (X_Webhook_Secret) which may arrive differently
+    secret = (
+        request.headers.get("x-webhook-secret")
+        or request.headers.get("x_webhook_secret")
+    )
+    verify_secret(secret)
 
     body = await request.json()
     logger.info(f"Webhook payload received: {body}")
