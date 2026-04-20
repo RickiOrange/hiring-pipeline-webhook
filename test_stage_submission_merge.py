@@ -14,6 +14,8 @@ from pipeline import (
     _detect_stage_submission,
     _normalize_name,
     _find_original_candidate,
+    _is_past_stage,
+    _stage_order_index,
 )
 
 
@@ -305,10 +307,60 @@ def test_find_original_candidate():
         pipeline.get_candidate_data = original_get_candidate_data
 
 
+def test_is_past_stage():
+    print("\n== _is_past_stage (game-prevention) ==")
+    spec_s2 = next(s for s in STAGE_SUBMISSION_SPECS if s["label"] == "Stage 2")
+    spec_s3 = next(s for s in STAGE_SUBMISSION_SPECS if s["label"] == "Stage 3")
+
+    def _props_with_stage(name):
+        return {"Stage": {"select": {"name": name}}} if name else {"Stage": {"select": None}}
+
+    # Candidate at Stage 2 Task, re-submits Stage 2 → NOT past
+    is_past, cur = _is_past_stage(_props_with_stage("Stage 2 Task"), spec_s2)
+    check("At Stage 2 Task, re-submits Stage 2 → not past", not is_past, f"cur={cur}")
+
+    # Candidate at Stage 3 Task, re-submits Stage 2 → past (BLOCK)
+    is_past, cur = _is_past_stage(_props_with_stage("Stage 3 Task"), spec_s2)
+    check("At Stage 3 Task, re-submits Stage 2 → past (block)", is_past, f"cur={cur}")
+
+    # Candidate at Stage 4 Task, re-submits Stage 2 → past (BLOCK)
+    is_past, cur = _is_past_stage(_props_with_stage("Stage 4 Task"), spec_s2)
+    check("At Stage 4 Task, re-submits Stage 2 → past (block)", is_past, f"cur={cur}")
+
+    # Candidate at Hired, re-submits Stage 3 → past (BLOCK)
+    is_past, cur = _is_past_stage(_props_with_stage("Hired"), spec_s3)
+    check("At Hired, re-submits Stage 3 → past (block)", is_past, f"cur={cur}")
+
+    # Candidate at Stage 3 Task, re-submits Stage 3 → NOT past (legit mid-stage resub)
+    is_past, cur = _is_past_stage(_props_with_stage("Stage 3 Task"), spec_s3)
+    check("At Stage 3 Task, re-submits Stage 3 → not past", not is_past, f"cur={cur}")
+
+    # Candidate at Applied, re-submits Stage 2 → NOT past (earlier than target)
+    is_past, cur = _is_past_stage(_props_with_stage("Applied"), spec_s2)
+    check("At Applied, re-submits Stage 2 → not past", not is_past, f"cur={cur}")
+
+    # Unknown stage (e.g. Rejected) → treated as not past
+    is_past, cur = _is_past_stage(_props_with_stage("Rejected"), spec_s2)
+    check("At Rejected, re-submits Stage 2 → not blocked (unknown order)", not is_past, f"cur={cur}")
+
+    # No Stage set at all → not past
+    is_past, cur = _is_past_stage(_props_with_stage(None), spec_s2)
+    check("No Stage set, re-submits Stage 2 → not past", not is_past, f"cur={cur}")
+
+    # Stage ordering sanity
+    check("STAGE_ORDER: Stage 3 Task > Stage 2 Task",
+          _stage_order_index("Stage 3 Task") > _stage_order_index("Stage 2 Task"))
+    check("STAGE_ORDER: Hired > Stage 5 Task",
+          _stage_order_index("Hired") > _stage_order_index("Stage 5 Task"))
+    check("STAGE_ORDER: unknown value → -1",
+          _stage_order_index("Bogus") == -1)
+
+
 def main():
     test_normalize_name()
     test_detect_stage_submission()
     test_find_original_candidate()
+    test_is_past_stage()
 
     print()
     if FAILURES:

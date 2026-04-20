@@ -148,6 +148,32 @@ def _check_hard_filters(candidate: dict, config: dict) -> str | None:
 # database instead of updating the candidate's existing row. The detector and
 # merger below recognise those orphan rows by stage and reunite them with the
 # original candidate record. Extend this list when a new stage form is added.
+# Ordered list of Stage select values used to determine whether a candidate
+# has already progressed past a given stage. "Rejected" and other values not
+# in this list are treated as unknown (won't block a re-submission).
+STAGE_ORDER = [
+    "Applied",
+    "Stage 1 Review",
+    "Stage 2 Task",
+    "Stage 3 Task",
+    "Stage 4 Task",
+    "Stage 5 Task",
+    "Final Interview",
+    "Hired",
+]
+
+
+def _stage_order_index(stage_name: str | None) -> int:
+    """Return the pipeline-order index for a Stage select value, or -1 if
+    unknown (e.g. 'Rejected' or None)."""
+    if not stage_name:
+        return -1
+    try:
+        return STAGE_ORDER.index(stage_name)
+    except ValueError:
+        return -1
+
+
 STAGE_SUBMISSION_SPECS = [
     {
         "label": "Stage 2",
@@ -327,14 +353,36 @@ def _find_original_candidate(name: str, email: str | None, db_id: str,
     return None
 
 
+def _is_past_stage(original_props: dict, spec: dict) -> tuple[bool, str | None]:
+    """True if the candidate's current Stage is already PAST the stage this
+    submission belongs to (game-prevention: can't retroactively boost an
+    earlier round's score once you've moved on).
+
+    Returns (is_past, current_stage_name).
+    """
+    current = (original_props.get("Stage") or {}).get("select") or {}
+    current_name = current.get("name")
+    current_idx = _stage_order_index(current_name)
+    submission_idx = _stage_order_index(spec.get("stage_task"))
+    if submission_idx < 0:
+        return (False, current_name)
+    return (current_idx > submission_idx, current_name)
+
+
 def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) -> dict:
     """Copy payload fields from the orphan into the original candidate page,
     then archive the orphan.
 
-    Last-wins policy: the new submission always takes precedence over any
-    existing values on the original page. When an existing value is being
-    overwritten, the property name is logged so the replacement is visible
-    in webhook logs.
+    Last-wins policy for mid-stage re-submissions: if the candidate is still
+    at '<Stage N> Task' and resubmits, the new submission overwrites the old
+    and their prior Stage N score is cleared so the per-stage scorer re-runs.
+
+    Game-prevention: if the candidate has already progressed PAST the stage
+    this submission belongs to (e.g. they're at Stage 3 Task and resubmit
+    Stage 2), the merge is blocked entirely — no fields written, old score
+    retained — and the orphan is archived. This stops candidates from
+    retroactively replacing a poor earlier-round submission after seeing
+    later-round results.
 
     Files are re-uploaded via Notion's file_uploads API so they persist on the
     target page (signed S3 URLs from the source would otherwise expire).
@@ -388,9 +436,28 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         if dest_text:
             overwritten_props.append(prop_name)
 
-    # --- Re-submission cleanup: if we overwrote anything, this is a re-submission.
-    # Clear the prior score + AI writeup and revert Stage so the per-stage scorer
-    # picks the candidate up again on the next run.
+    # --- Game-prevention: if a re-submission would overwrite existing data
+    # AND the candidate has already progressed past this stage, drop the
+    # whole merge. The orphan is still archived so the DB stays clean.
+    if overwritten_props:
+        is_past, current_stage_name = _is_past_stage(original_props, spec)
+        if is_past:
+            print(f"  [{label} re-submission BLOCKED] candidate is at "
+                  f"{current_stage_name!r} (past {spec['stage_task']!r}); "
+                  f"retaining prior score and data. Orphan archived.")
+            archive_page(orphan_id)
+            return {
+                "merged": False,
+                "blocked_reason": "past_stage",
+                "orphan_id": orphan_id,
+                "original_id": original_id,
+                "stage_label": label,
+                "current_stage": current_stage_name,
+            }
+
+    # --- Re-submission cleanup: if we overwrote anything (and we're still at
+    # or before this stage), clear the prior score + AI writeup and revert
+    # Stage so the per-stage scorer picks the candidate up again.
     reset_for_rescore = False
     if overwritten_props:
         score_prop_name = spec.get("score_prop")
@@ -467,6 +534,12 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
             return {"page_id": page_id, "name": name, "decision": f"{label} unmatched",
                     "score": None, "reasoning": msg}
         merge_result = _merge_stage_submission(page, original, spec)
+        if merge_result.get("blocked_reason") == "past_stage":
+            reasoning = (f"{label} re-submission blocked: candidate already at "
+                         f"{merge_result['current_stage']!r} (past {spec['stage_task']!r}). "
+                         f"Prior score retained; orphan archived.")
+            return {"page_id": page_id, "name": name, "decision": f"{label} blocked",
+                    "score": None, "reasoning": reasoning}
         if merge_result.get("merged"):
             print(f"  Merged into {merge_result['original_id']} "
                   f"(fields: {merge_result['fields_merged']})")
