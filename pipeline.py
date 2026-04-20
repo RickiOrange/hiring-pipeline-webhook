@@ -151,6 +151,8 @@ def _check_hard_filters(candidate: dict, config: dict) -> str | None:
 STAGE_SUBMISSION_SPECS = [
     {
         "label": "Stage 2",
+        "score_prop": "Stage 2 Score",
+        "stage_task": "Stage 2 Task",
         "file_props": [
             "Notion task screenshots",
             "Spreadsheet task screenshots",
@@ -166,16 +168,22 @@ STAGE_SUBMISSION_SPECS = [
     },
     {
         "label": "Stage 3",
+        "score_prop": "Stage 3 Score",
+        "stage_task": "Stage 3 Task",
         "file_props": [],
         "text_props": ["Stage 3 Submission"],
     },
     {
         "label": "Stage 4",
+        "score_prop": "Stage 4 Score",
+        "stage_task": "Stage 4 Task",
         "file_props": [],
         "text_props": ["Stage 4 Submission"],
     },
     {
         "label": "Stage 5",
+        "score_prop": "Stage 5 Score",
+        "stage_task": "Stage 5 Task",
         "file_props": [
             "Stage 5 BTC Screenshot",
             "On-chain transaction screenshot",
@@ -380,8 +388,24 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         if dest_text:
             overwritten_props.append(prop_name)
 
+    # --- Re-submission cleanup: if we overwrote anything, this is a re-submission.
+    # Clear the prior score + AI writeup and revert Stage so the per-stage scorer
+    # picks the candidate up again on the next run.
+    reset_for_rescore = False
     if overwritten_props:
+        score_prop_name = spec.get("score_prop")
+        stage_task_value = spec.get("stage_task")
+        if score_prop_name:
+            patch_props[score_prop_name] = {"number": None}
+        # Clear AI writeup (these get overwritten by each stage's evaluator anyway)
+        patch_props["AI Reasoning"] = {"rich_text": []}
+        patch_props["Strengths"] = {"rich_text": []}
+        patch_props["Weaknesses"] = {"rich_text": []}
+        if stage_task_value:
+            patch_props["Stage"] = {"select": {"name": stage_task_value}}
+        reset_for_rescore = True
         print(f"  [{label} re-submission] replaced prior values on {original_id} for: {overwritten_props}")
+        print(f"  [{label} re-submission] cleared score + AI writeup; reverted Stage to {stage_task_value!r}")
 
     if patch_props:
         patch_page_properties(original_id, patch_props)
@@ -396,6 +420,7 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         "stage_label": label,
         "fields_merged": list(patch_props.keys()),
         "fields_overwritten": overwritten_props,
+        "reset_for_rescore": reset_for_rescore,
     }
 
 
@@ -447,8 +472,8 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
                   f"(fields: {merge_result['fields_merged']})")
             reasoning = f"Merged {label} submission into {merge_result['original_id']}; orphan archived"
             if merge_result.get("fields_overwritten"):
-                reasoning += (f" (re-submission: overwrote existing values in "
-                              f"{merge_result['fields_overwritten']})")
+                reasoning += (f" (re-submission: overwrote {merge_result['fields_overwritten']}; "
+                              f"cleared prior score and reverted to {spec['stage_task']} for re-scoring)")
             return {"page_id": page_id, "name": name, "decision": f"{label} merged",
                     "score": None, "reasoning": reasoning}
         else:
