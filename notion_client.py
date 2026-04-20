@@ -279,3 +279,74 @@ def _make_rich_text_blocks(text: str) -> list[dict]:
     for i in range(0, len(text), 2000):
         chunks.append({"type": "text", "text": {"content": text[i:i + 2000]}})
     return chunks
+
+
+# --- File transfer helpers (used by the Stage 2 submission auto-merge) ---
+
+_UPLOAD_HEADERS = {
+    "Authorization": f"Bearer {NOTION_API_KEY}",
+    "Notion-Version": NOTION_VERSION,
+}
+
+
+def _guess_content_type(filename: str) -> str:
+    ext = filename.lower().rsplit(".", 1)[-1]
+    return {
+        "png": "image/png",
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "gif": "image/gif", "webp": "image/webp", "bmp": "image/bmp",
+        "pdf": "application/pdf",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "doc": "application/msword",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    }.get(ext, "application/octet-stream")
+
+
+def transfer_file_to_notion(source_url: str, filename: str) -> dict:
+    """Download a file from a URL and re-upload it to Notion's file storage.
+
+    Returns a Notion files-property entry ready to be placed inside
+    {"files": [<entry>, ...]}.
+    """
+    content_type = _guess_content_type(filename)
+
+    # 1) Download the source file bytes
+    with httpx.Client(timeout=120, follow_redirects=True) as client:
+        dl = client.get(source_url)
+        dl.raise_for_status()
+        payload = dl.content
+
+    # 2) Create a Notion file_upload object
+    with httpx.Client(timeout=30) as client:
+        fu = client.post(
+            f"{BASE_URL}/file_uploads",
+            headers=HEADERS,
+            json={"mode": "single_part", "filename": filename, "content_type": content_type},
+        )
+        fu.raise_for_status()
+        fu_data = fu.json()
+
+    upload_url = fu_data["upload_url"]
+    fu_id = fu_data["id"]
+
+    # 3) Send the bytes to the upload_url (multipart)
+    with httpx.Client(timeout=120) as client:
+        send = client.post(
+            upload_url,
+            headers=_UPLOAD_HEADERS,
+            files={"file": (filename, payload, content_type)},
+        )
+        send.raise_for_status()
+
+    return {"type": "file_upload", "file_upload": {"id": fu_id}, "name": filename}
+
+
+def archive_page(page_id: str) -> dict:
+    """Archive (soft-delete) a page."""
+    return _request("PATCH", f"/pages/{page_id}", {"archived": True})
+
+
+def patch_page_properties(page_id: str, properties: dict) -> dict:
+    """Generic property patch — bypasses update_candidate's narrow type allowlist."""
+    return _request("PATCH", f"/pages/{page_id}", {"properties": properties})

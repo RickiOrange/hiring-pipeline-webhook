@@ -14,6 +14,11 @@ from notion_client import (
     update_candidate,
     advance_candidate,
     reject_candidate,
+    transfer_file_to_notion,
+    archive_page,
+    patch_page_properties,
+    _request,
+    _make_rich_text_blocks,
 )
 from evaluator import evaluate_candidate, evaluate_ranking, evaluate_with_images, fetch_cv_content
 from bitcoin_verifier import (
@@ -139,19 +144,320 @@ def _check_hard_filters(candidate: dict, config: dict) -> str | None:
     return None
 
 
+# Stage 2+ submission forms each create a NEW row in the Candidate Applications
+# database instead of updating the candidate's existing row. The detector and
+# merger below recognise those orphan rows by stage and reunite them with the
+# original candidate record. Extend this list when a new stage form is added.
+STAGE_SUBMISSION_SPECS = [
+    {
+        "label": "Stage 2",
+        "file_props": [
+            "Notion task screenshots",
+            "Spreadsheet task screenshots",
+            "Presentation task screenshots (each slide)",
+            "Upload your task",
+        ],
+        "text_props": [
+            "A.I. email draft (1/3) - prompts",
+            "A.I. email draft (2/3) - non edited version",
+            "A.I. email draft (3/3) - edited version",
+            "Stage 2 Submission",
+        ],
+    },
+    {
+        "label": "Stage 3",
+        "file_props": [],
+        "text_props": ["Stage 3 Submission"],
+    },
+    {
+        "label": "Stage 4",
+        "file_props": [],
+        "text_props": ["Stage 4 Submission"],
+    },
+    {
+        "label": "Stage 5",
+        "file_props": [
+            "Stage 5 BTC Screenshot",
+            "On-chain transaction screenshot",
+            "Stage 5 Lightning Screenshot",
+            "Lightning payment screenshot",
+        ],
+        "text_props": [
+            "Stage 5 BTC Transaction ID",
+            "On-chain transaction ID",
+            "Stage 5 Lightning Payment Hash",
+            "Lightning transaction proof of payment",
+            "How many Satoshis did you send on-chain?",
+            "How many Satoshis did you send via Lightning?",
+        ],
+    },
+]
+
+
+def _has_stage1_data(candidate: dict) -> bool:
+    """True if the page carries real Stage 1 application data (CV, writing test,
+    age, or experience). Orphan submission pages lack all of these."""
+    return bool(
+        candidate.get("cv_upload")
+        or candidate.get("writing_test")
+        or candidate.get("age_range")
+        or candidate.get("years_sales_range")
+    )
+
+
+def _has_payload_for_spec(page_props: dict, spec: dict) -> bool:
+    """True if the page has at least one populated field named in spec."""
+    for prop_name in spec["file_props"]:
+        if (page_props.get(prop_name) or {}).get("files"):
+            return True
+    for prop_name in spec["text_props"]:
+        rt = (page_props.get(prop_name) or {}).get("rich_text") or []
+        if "".join(t.get("plain_text", "") for t in rt).strip():
+            return True
+    return False
+
+
+def _detect_stage_submission(candidate: dict, page_props: dict) -> dict | None:
+    """If this page looks like an orphan submission from a stage form, return
+    the matching spec. Otherwise None.
+
+    A page is a stage-N submission orphan iff:
+      - it has no Stage 1 data (no CV / writing / age / experience), AND
+      - at least one field in the stage's file_props or text_props is populated.
+
+    If multiple stages match (unlikely but possible — a form accidentally
+    populates fields across stages), the LATEST stage wins so the candidate's
+    most-recent submission is honoured.
+    """
+    if _has_stage1_data(candidate):
+        return None
+    matches = [s for s in STAGE_SUBMISSION_SPECS if _has_payload_for_spec(page_props, s)]
+    if not matches:
+        return None
+    # Take the latest-stage spec (by list order — specs are ordered Stage 2→5)
+    return matches[-1]
+
+
+def _normalize_name(s: str | None) -> str:
+    """Lowercase, strip, and collapse internal whitespace. Used for name
+    comparison so trailing spaces and double-spaces don't break matching."""
+    if not s:
+        return ""
+    return " ".join(s.split()).lower()
+
+
+def _find_original_candidate(name: str, email: str | None, db_id: str,
+                             exclude_page_id: str) -> dict | None:
+    """Locate the candidate's existing record in the Candidate Applications
+    database, using full name as the primary key and email as a tiebreaker.
+
+    Matching order (per Ricki: full name takes priority; email disambiguates):
+      1. Exact normalised full-name match → if exactly one non-archived row,
+         that's the match. If multiple, disambiguate by email; if email doesn't
+         resolve, prefer the row with an AI Score Stage 1 (the real Stage 1
+         record) to avoid matching a prior orphan.
+      2. No full-name match → match by email. If exactly one row has this
+         email, use it (covers cases where the candidate typed only their
+         first name, or a minor spelling variation).
+      3. Otherwise None — log [unmatched] for manual review.
+    """
+    all_rows = get_candidates(db_id)
+    candidates = [
+        r for r in all_rows
+        if r["id"] != exclude_page_id and not r.get("archived") and not r.get("in_trash")
+    ]
+
+    target_name = _normalize_name(name)
+    target_email = (email or "").strip().lower() or None
+
+    # --- 1. Exact normalised full-name match
+    name_matches = []
+    for c in candidates:
+        cd = get_candidate_data(c)
+        if _normalize_name(cd.get("full_name")) == target_name and target_name:
+            name_matches.append((c, cd))
+
+    if len(name_matches) == 1:
+        return name_matches[0][0]
+
+    if len(name_matches) > 1:
+        # Disambiguate by email
+        if target_email:
+            email_hits = [(c, cd) for (c, cd) in name_matches
+                          if (cd.get("email") or "").strip().lower() == target_email]
+            if len(email_hits) == 1:
+                return email_hits[0][0]
+            if len(email_hits) > 1:
+                # Prefer the one with a real Stage 1 score
+                with_score = [(c, cd) for (c, cd) in email_hits
+                              if (c.get("properties", {}).get("AI Score Stage 1", {}) or {}).get("number") is not None]
+                if with_score:
+                    return with_score[0][0]
+                return email_hits[0][0]
+        # No email or email didn't help → prefer row with Stage 1 score
+        with_score = [(c, cd) for (c, cd) in name_matches
+                      if (c.get("properties", {}).get("AI Score Stage 1", {}) or {}).get("number") is not None]
+        if with_score:
+            return with_score[0][0]
+        return None  # ambiguous — don't guess
+
+    # --- 2. No name match → fall back to email
+    if target_email:
+        email_hits = []
+        for c in candidates:
+            cd = get_candidate_data(c)
+            if (cd.get("email") or "").strip().lower() == target_email:
+                email_hits.append((c, cd))
+        if len(email_hits) == 1:
+            return email_hits[0][0]
+        if len(email_hits) > 1:
+            with_score = [(c, cd) for (c, cd) in email_hits
+                          if (c.get("properties", {}).get("AI Score Stage 1", {}) or {}).get("number") is not None]
+            if with_score:
+                return with_score[0][0]
+
+    return None
+
+
+def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) -> dict:
+    """Copy payload fields from the orphan into the original candidate page,
+    then archive the orphan.
+
+    First-wins policy: if the original already has data in a given property,
+    DO NOT overwrite it. Log a warning instead. The orphan is still archived
+    so the DB doesn't fill up with duplicates.
+
+    Files are re-uploaded via Notion's file_uploads API so they persist on the
+    target page (signed S3 URLs from the source would otherwise expire).
+    """
+    orphan_id = orphan_page["id"]
+    original_id = original_page["id"]
+    orphan_props = orphan_page.get("properties", {})
+    original_props = original_page.get("properties", {})
+    label = spec["label"]
+
+    patch_props: dict = {}
+    skipped_props: list[str] = []
+
+    # --- File properties
+    for prop_name in spec["file_props"]:
+        src_prop = orphan_props.get(prop_name) or {}
+        src_files = src_prop.get("files", [])
+        if not src_files:
+            continue
+        # First-wins: skip if original already populated
+        dest_existing = (original_props.get(prop_name) or {}).get("files") or []
+        if dest_existing:
+            skipped_props.append(prop_name)
+            continue
+        new_entries = []
+        for f in src_files:
+            ftype = f.get("type")
+            if ftype == "file":
+                url = f.get("file", {}).get("url")
+            elif ftype == "external":
+                url = f.get("external", {}).get("url")
+            else:
+                url = None
+            fname = f.get("name") or "file"
+            if not url:
+                continue
+            try:
+                new_entries.append(transfer_file_to_notion(url, fname))
+            except Exception as e:
+                print(f"  WARN: failed to transfer file {fname}: {e}")
+        if new_entries:
+            patch_props[prop_name] = {"files": new_entries}
+
+    # --- Text properties
+    for prop_name in spec["text_props"]:
+        src_prop = orphan_props.get(prop_name) or {}
+        text = "".join(t.get("plain_text", "") for t in src_prop.get("rich_text", []))
+        if not text.strip():
+            continue
+        dest_rt = (original_props.get(prop_name) or {}).get("rich_text") or []
+        dest_text = "".join(t.get("plain_text", "") for t in dest_rt).strip()
+        if dest_text:
+            skipped_props.append(prop_name)
+            continue
+        patch_props[prop_name] = {"rich_text": _make_rich_text_blocks(text)}
+
+    if skipped_props:
+        print(f"  [{label} re-submission] kept existing values on {original_id} for: {skipped_props}")
+
+    if patch_props:
+        patch_page_properties(original_id, patch_props)
+
+    # Archive the orphan either way — a re-submission should not leave a dangling row
+    archive_page(orphan_id)
+
+    return {
+        "merged": bool(patch_props),
+        "orphan_id": orphan_id,
+        "original_id": original_id,
+        "stage_label": label,
+        "fields_merged": list(patch_props.keys()),
+        "fields_skipped": skipped_props,
+    }
+
+
 def process_single_stage1(page_id: str, config: dict) -> dict:
     """Process a single candidate through Stage 1 (hard filters + AI evaluation).
 
     Called by the webhook server for real-time processing, and by run_stage1()
     for batch processing. Returns a result dict with the outcome.
+
+    Special-case: if the incoming page looks like a Stage 2 task submission
+    (from the task submission form, which unfortunately creates a new DB row
+    instead of updating the candidate's existing row), merge the submission
+    into the original candidate and skip Stage 1 processing.
     """
     thresholds = config["thresholds"]
     stages = config["stages"]
+    db_id = config["notion_database_id"]
 
     # Fetch the single page
     page = get_page(page_id)
     candidate = get_candidate_data(page)
     name = candidate["full_name"]
+    email = candidate.get("email")
+
+    # --- Idempotency: if Notion fires the webhook twice or we're asked to
+    # re-process an already-archived page, do nothing.
+    if page.get("archived") or page.get("is_archived") or page.get("in_trash"):
+        return {"page_id": page_id, "name": name, "decision": "Already archived",
+                "score": None, "reasoning": "Page is archived; skipping"}
+
+    # --- Stage 2+ submission auto-merge ---
+    # Applied BEFORE the idempotency-by-score check and BEFORE hard filters, so
+    # Stage 1 disqualifiers (missing CV, missing age, etc.) do not wrongly reject
+    # stage submissions that legitimately carry only task payloads.
+    spec = _detect_stage_submission(candidate, page.get("properties", {}))
+    if spec:
+        label = spec["label"]
+        print(f"[{label} submission detected] page={page_id} name={name!r} email={email!r}")
+        original = _find_original_candidate(name, email, db_id, exclude_page_id=page_id)
+        if not original:
+            msg = (f"{label} submission for name={name!r} email={email!r} but no matching "
+                   f"candidate found — left in place for manual review")
+            print(f"  [{label} unmatched] {msg}")
+            return {"page_id": page_id, "name": name, "decision": f"{label} unmatched",
+                    "score": None, "reasoning": msg}
+        merge_result = _merge_stage_submission(page, original, spec)
+        if merge_result.get("merged"):
+            print(f"  Merged into {merge_result['original_id']} "
+                  f"(fields: {merge_result['fields_merged']})")
+            reasoning = f"Merged {label} submission into {merge_result['original_id']}; orphan archived"
+            if merge_result.get("fields_skipped"):
+                reasoning += f" (skipped fields already populated: {merge_result['fields_skipped']})"
+            return {"page_id": page_id, "name": name, "decision": f"{label} merged",
+                    "score": None, "reasoning": reasoning}
+        else:
+            # No new fields written (all conflicts), but orphan was archived
+            return {"page_id": page_id, "name": name, "decision": f"{label} duplicate",
+                    "score": None,
+                    "reasoning": (f"{label} re-submission — all fields already populated on "
+                                  f"{merge_result['original_id']}; orphan archived")}
 
     # Idempotency: skip if already scored
     existing_score = page.get("properties", {}).get("AI Score Stage 1", {}).get("number")
