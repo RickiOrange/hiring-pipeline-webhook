@@ -323,9 +323,10 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
     """Copy payload fields from the orphan into the original candidate page,
     then archive the orphan.
 
-    First-wins policy: if the original already has data in a given property,
-    DO NOT overwrite it. Log a warning instead. The orphan is still archived
-    so the DB doesn't fill up with duplicates.
+    Last-wins policy: the new submission always takes precedence over any
+    existing values on the original page. When an existing value is being
+    overwritten, the property name is logged so the replacement is visible
+    in webhook logs.
 
     Files are re-uploaded via Notion's file_uploads API so they persist on the
     target page (signed S3 URLs from the source would otherwise expire).
@@ -337,7 +338,7 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
     label = spec["label"]
 
     patch_props: dict = {}
-    skipped_props: list[str] = []
+    overwritten_props: list[str] = []
 
     # --- File properties
     for prop_name in spec["file_props"]:
@@ -345,11 +346,7 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         src_files = src_prop.get("files", [])
         if not src_files:
             continue
-        # First-wins: skip if original already populated
         dest_existing = (original_props.get(prop_name) or {}).get("files") or []
-        if dest_existing:
-            skipped_props.append(prop_name)
-            continue
         new_entries = []
         for f in src_files:
             ftype = f.get("type")
@@ -368,6 +365,8 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
                 print(f"  WARN: failed to transfer file {fname}: {e}")
         if new_entries:
             patch_props[prop_name] = {"files": new_entries}
+            if dest_existing:
+                overwritten_props.append(prop_name)
 
     # --- Text properties
     for prop_name in spec["text_props"]:
@@ -377,13 +376,12 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
             continue
         dest_rt = (original_props.get(prop_name) or {}).get("rich_text") or []
         dest_text = "".join(t.get("plain_text", "") for t in dest_rt).strip()
-        if dest_text:
-            skipped_props.append(prop_name)
-            continue
         patch_props[prop_name] = {"rich_text": _make_rich_text_blocks(text)}
+        if dest_text:
+            overwritten_props.append(prop_name)
 
-    if skipped_props:
-        print(f"  [{label} re-submission] kept existing values on {original_id} for: {skipped_props}")
+    if overwritten_props:
+        print(f"  [{label} re-submission] replaced prior values on {original_id} for: {overwritten_props}")
 
     if patch_props:
         patch_page_properties(original_id, patch_props)
@@ -397,7 +395,7 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         "original_id": original_id,
         "stage_label": label,
         "fields_merged": list(patch_props.keys()),
-        "fields_skipped": skipped_props,
+        "fields_overwritten": overwritten_props,
     }
 
 
@@ -448,16 +446,17 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
             print(f"  Merged into {merge_result['original_id']} "
                   f"(fields: {merge_result['fields_merged']})")
             reasoning = f"Merged {label} submission into {merge_result['original_id']}; orphan archived"
-            if merge_result.get("fields_skipped"):
-                reasoning += f" (skipped fields already populated: {merge_result['fields_skipped']})"
+            if merge_result.get("fields_overwritten"):
+                reasoning += (f" (re-submission: overwrote existing values in "
+                              f"{merge_result['fields_overwritten']})")
             return {"page_id": page_id, "name": name, "decision": f"{label} merged",
                     "score": None, "reasoning": reasoning}
         else:
-            # No new fields written (all conflicts), but orphan was archived
-            return {"page_id": page_id, "name": name, "decision": f"{label} duplicate",
+            # Orphan had no usable payload — nothing written, but still archived
+            return {"page_id": page_id, "name": name, "decision": f"{label} empty",
                     "score": None,
-                    "reasoning": (f"{label} re-submission — all fields already populated on "
-                                  f"{merge_result['original_id']}; orphan archived")}
+                    "reasoning": (f"{label} submission had no payload fields populated "
+                                  f"for {merge_result['original_id']}; orphan archived")}
 
     # Idempotency: skip if already scored
     existing_score = page.get("properties", {}).get("AI Score Stage 1", {}).get("number")
