@@ -1,0 +1,277 @@
+# Hiring Pipeline Webhook
+
+AI-scored hiring pipeline for Orange Global Services' **Business Development Lead** role. A candidate's journey is 5 stages — questionnaire, systems test, sales simulation, marketing/outreach, Bitcoin task — each scored by Claude against prompts stored in Notion.
+
+Notion is the system of record for candidates. A Railway-hosted FastAPI webhook watches the Candidate Applications database, scores new Stage 1 applications in real time, and merges Stage 2–5 task submissions into the correct candidate row. Stages 2–5 are still scored in batch via a CLI (`run.py`).
+
+## Why the webhook exists
+
+Notion forms can only **create** rows — they can't update an existing candidate's row. That means every time a candidate submits a task via a Notion form, a NEW row appears in the Candidate Applications database with only the submitted payload (no CV, no demographics). Without intervention, those orphan rows:
+
+1. Pollute the database with duplicates of the same candidate.
+2. Trigger Stage 1 hard filters (missing CV → auto-reject), destroying the submission signal.
+3. Hide the actual submission data on a "Rejected" row that the per-stage scorer never scans.
+
+The webhook solves this by detecting orphan submissions, matching them back to the original candidate row, and merging in the payload — while enforcing rules that prevent candidates from gaming their scores via re-submission.
+
+## High-level architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Notion: Candidate Applications database                             │
+│                                                                      │
+│  Stage 1 form ──creates──▶ new row (full application)                │
+│  Stage 2 form ──creates──▶ orphan row (just task files + email)      │
+│  Stage 3 form ──creates──▶ orphan row (just text submission + email) │
+│  Stage 4 form ──creates──▶ orphan row                                │
+│  Stage 5 form ──creates──▶ orphan row                                │
+│                                                                      │
+│  Notion automation: "Page added" ─webhook─▶ Railway                  │
+└──────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  Railway: FastAPI server (server.py → pipeline.process_single_stage1)│
+│                                                                      │
+│  1. Is this page already archived?         → return                  │
+│  2. Does it look like a Stage 2-5 orphan?  → merge + archive orphan  │
+│  3. Otherwise, it's a Stage 1 application  → hard filters + Claude   │
+└──────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  CLI (run.py) — batch Stage 2-5 scoring                              │
+│                                                                      │
+│  python run.py --role head_of_sales stage2  (vision: screenshots)    │
+│  python run.py --role head_of_sales stage3  (text evaluation)        │
+│  python run.py --role head_of_sales stage4  (text evaluation)        │
+│  python run.py --role head_of_sales stage5  (Bitcoin verification)   │
+│  python run.py --role head_of_sales rank    (composite ranking)      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+## The 5 stages
+
+| Stage | What's measured | Scoring | Pass |
+|---|---|---|---|
+| 1 — Application | Structured questionnaire + writing sample | Claude text, `/100` | 60+ |
+| 2 — Systems Competency | Notion pipeline, Google Sheets, Slides, AI email (screenshots) | Claude vision, `/20` | 12+ |
+| 3 — Sales Process | Executive sales simulation (text) | Claude text, `/35` | 22+ |
+| 4 — Marketing Outreach | Cold outreach artefacts (text) | Claude text, `/25` | 15+ |
+| 5 — Bitcoin Task | On-chain + Lightning payment with screenshots | Automated verification, `/6` | 4+ |
+
+Thresholds and composite weights live in [`config/head_of_sales.yaml`](config/head_of_sales.yaml).
+
+## Stage 2–5 submission auto-merge (the important bit)
+
+Each stage form writes to the same Candidate Applications database. Full Name and Email are **required** on every form, which gives the webhook two signals to reunite the orphan row with the candidate's real record.
+
+### Detection
+
+[`pipeline.py`](pipeline.py) defines `STAGE_SUBMISSION_SPECS` — a table of which file and text properties belong to each stage:
+
+```python
+STAGE_SUBMISSION_SPECS = [
+    {
+        "label": "Stage 2",
+        "score_prop": "Stage 2 Score",
+        "stage_task": "Stage 2 Task",
+        "file_props": [...],   # screenshots
+        "text_props": [...],   # email-draft text fields
+    },
+    {"label": "Stage 3", ...},
+    ...
+]
+```
+
+`_detect_stage_submission(candidate, props)` returns the matching spec if the incoming page has **no Stage 1 data** (no CV, writing test, age, experience) and **at least one** of the spec's fields populated. If so, the webhook branches into the merge path **before** Stage 1 hard filters run — so a legitimate Stage 2 submission is never rejected for missing a CV.
+
+### Matching (who does this submission belong to?)
+
+`_find_original_candidate(name, email, db_id, exclude)` uses **name as the primary key, email as the disambiguator**:
+
+1. **Exact normalised name match** — trim, lowercase, collapse whitespace. One hit → match. Multiple hits → email breaks the tie. If that's still ambiguous, prefer the row with `AI Score Stage 1` set.
+2. **No name match** → fall back to email. Handles candidates who typed only a first name, or a minor spelling variation.
+3. **Neither resolves** → log `[Stage N unmatched]` and leave the orphan for manual review.
+
+Normalisation explicitly tolerates trailing whitespace (`"Benzile Makhanya "` in the DB vs `"Benzile Makhanya"` typed in the form) which would otherwise break exact-match filters.
+
+### Merging
+
+`_merge_stage_submission(orphan, original, spec)`:
+
+1. Downloads each file from the orphan's signed S3 URL.
+2. Re-uploads it via Notion's `file_uploads` API (signed URLs expire; re-upload makes the files permanent on the target page).
+3. Copies text properties across.
+4. Archives the orphan row.
+
+### Re-submission policy
+
+| Candidate's current Stage | Submits form for... | Result |
+|---|---|---|
+| Applied / Stage 1 Review | Stage 2 | Normal first-time merge |
+| Stage 2 Task | **Stage 2 again** | **Last-wins** — overwrite files/text, clear `Stage 2 Score` + AI writeup, Stage stays at `Stage 2 Task` so re-scoring picks them up |
+| Stage 3 Task | **Stage 2** | **BLOCKED** — files/text discarded, orphan archived, prior score retained (game-prevention) |
+| Stage 4+ / Hired | Stage 2 or 3 | **BLOCKED** |
+| Stage 3 Task | Stage 3 again | Last-wins (same-stage re-submission) |
+| Rejected | anything | Not blocked — treated as unknown ordering, manual review |
+
+The ordering is defined by `STAGE_ORDER` in [`pipeline.py`](pipeline.py). `_is_past_stage(props, spec)` returns whether the candidate has progressed beyond the stage the orphan belongs to.
+
+### Log lines to grep in Railway
+
+```
+[Stage N submission detected] page=... name=... email=...
+  Merged into <original_id> (fields: [...])
+
+[Stage N re-submission] replaced prior values on <id> for: [...]
+[Stage N re-submission] cleared score + AI writeup; reverted Stage to 'Stage N Task'
+
+[Stage N re-submission BLOCKED] candidate is at 'Stage M Task' (past 'Stage N Task');
+  retaining prior score and data. Orphan archived.
+
+[Stage N unmatched] ... no matching candidate found — left in place for manual review
+```
+
+## Directory layout
+
+```
+automation/
+├── server.py                       # FastAPI webhook (Railway entrypoint)
+├── pipeline.py                     # Core orchestration — stages 1-5 + auto-merge
+├── notion_client.py                # Notion API client + file-transfer helpers
+├── evaluator.py                    # Claude text + vision evaluation wrappers
+├── bitcoin_verifier.py             # Stage 5 on-chain + Lightning verification
+├── run.py                          # CLI entrypoint (batch stage scoring, ranking)
+├── config/
+│   └── head_of_sales.yaml          # Role config: thresholds, weights, hard filters
+├── test_stage_submission_merge.py  # Synthetic tests for merge logic (no Notion calls)
+├── Procfile                        # Railway: `web: uvicorn server:app ...`
+├── requirements.txt
+└── README.md                       # (this file)
+```
+
+**Notion IDs** (referenced from code/config):
+- Candidate Applications database: `336eddaa-d74c-8188-b616-c32aa4da025e`
+- AI Prompts page: `336eddaa-d74c-814e-90f6-db7f3f5d98d6`
+- Interview Candidates database: `33eeddaa-d74c-81e5-ad77-e4861d37dc1c`
+
+## Running locally
+
+### Setup
+
+```bash
+cd automation
+pip install -r requirements.txt
+```
+
+Create `automation/.env`:
+
+```
+ANTHROPIC_API_KEY=sk-ant-...
+NOTION_API_KEY=ntn_...
+WEBHOOK_SECRET=<any random string>
+ROLE=head_of_sales
+```
+
+### CLI (batch scoring)
+
+```bash
+# Score all candidates currently at each stage
+python run.py --role head_of_sales stage1   # NB: stage 1 is now real-time via webhook
+python run.py --role head_of_sales stage2
+python run.py --role head_of_sales stage3
+python run.py --role head_of_sales stage4
+python run.py --role head_of_sales stage5
+
+# Generate composite ranking across all passers
+python run.py --role head_of_sales rank
+```
+
+### Webhook server (local dev)
+
+```bash
+uvicorn server:app --reload --port 8000
+```
+
+Then POST a mock Notion "Page added" payload:
+
+```bash
+curl -X POST http://localhost:8000/webhook/stage1 \
+  -H "Content-Type: application/json" \
+  -H "x-webhook-secret: $WEBHOOK_SECRET" \
+  -d '{"id": "<notion-page-id>"}'
+```
+
+Health check: `GET /health`.
+
+### Tests
+
+Pure-Python synthetic tests for the stage-submission logic (no Notion calls):
+
+```bash
+python -X utf8 test_stage_submission_merge.py
+```
+
+Covers:
+- Name normalisation (trailing whitespace, case, internal double-spaces)
+- Stage detection (Stage 1 application vs Stage 2/3/5 orphans)
+- Matching (exact, trailing-space, first-name-only-with-email, ambiguous-name-with-email, case-insensitive, archived exclusion)
+- `_is_past_stage` / game-prevention (Stage 3 Task candidate re-submits Stage 2 → blocked)
+
+## Deployment
+
+Hosted on Railway, auto-deploys from `main` on push to GitHub.
+
+- Repo: [RickiOrange/hiring-pipeline-webhook](https://github.com/RickiOrange/hiring-pipeline-webhook)
+- Production URL: `https://hiring-pipeline-webhook-production.up.railway.app`
+- Endpoints: `POST /webhook/stage1`, `GET /health`
+
+Railway environment variables mirror `.env`:
+
+- `ANTHROPIC_API_KEY`
+- `NOTION_API_KEY`
+- `WEBHOOK_SECRET`
+- `ROLE` (default `head_of_sales`)
+
+**Notion automation** (configured in Notion, not in this repo): "Page added" trigger on the Candidate Applications database → POST to `<railway-url>/webhook/stage1` with the `x-webhook-secret` header.
+
+## Extending to a new role or stage
+
+### New role
+
+1. Add `config/<role>.yaml` following the head_of_sales schema.
+2. Add prompts to a new Notion AI Prompts page and reference its ID in the config.
+3. Run with `--role <role>`.
+
+### New stage
+
+1. Add properties to the Candidate Applications database for the stage's files/text and score.
+2. Add a Notion form for the new stage's task submissions (require Full Name + Email).
+3. Add a new entry to `STAGE_SUBMISSION_SPECS` in [`pipeline.py`](pipeline.py) with its `file_props`, `text_props`, `score_prop`, `stage_task`.
+4. Add the new Stage's select value to `STAGE_ORDER` (in the right position).
+5. Implement a `run_stageN(config)` function and register it in `run.py`.
+
+## Troubleshooting
+
+**"Candidate submitted but isn't showing up for scoring"**
+- Check Railway logs for `[Stage N submission detected]` on the submission timestamp. If present, look for `Merged into <id>` — the original row should now have the files.
+- If you see `[Stage N unmatched]`, the form's Name + Email didn't resolve to an existing candidate. Check that the candidate's original row has their actual name spelled the same way, or that they used the same email.
+- If you see `[Stage N re-submission BLOCKED]`, the candidate had already progressed past that stage. Their old score is retained — this is game-prevention.
+
+**"A candidate's Stage 2 Score suddenly disappeared"**
+- They re-submitted Stage 2 while still at `Stage 2 Task`. Policy is last-wins: old files + score cleared, Stage reverted to `Stage 2 Task`. Run `python run.py ... stage2` to re-score.
+
+**"Stage 1 hard filter rejected a real candidate"**
+- A genuine Stage 1 application should have CV + age + experience. If one of those is missing, the hard filters in `_check_hard_filters` fire. The stage-submission detector ONLY triggers when ALL of those are absent AND a stage-specific payload is present — so it can't accidentally rescue a broken Stage 1 application.
+
+**Re-uploading files failed mid-merge**
+- Logs will show `WARN: failed to transfer file <name>: <error>`. The orphan is NOT archived in this case (we keep it around so the files can be retried). Re-fire the webhook manually by POSTing to `/webhook/stage1` with the orphan's page ID once the root cause is fixed.
+
+## Design decisions worth knowing
+
+1. **Submission detection runs BEFORE hard filters.** A Stage 2 orphan has no CV by design; hard-filtering it would wrongly reject a legitimate candidate. This invariant is load-bearing — do not reorder the checks in `process_single_stage1`.
+2. **File re-upload, not URL reference.** The signed S3 URLs on Notion file properties expire in ~1 hour. The merge re-uploads files via Notion's `file_uploads` API so they persist on the candidate's row indefinitely.
+3. **Name-primary, email-disambiguator matching.** Ricki's rule: people rarely misspell their own name, so full name takes priority. Email is only consulted when name alone is ambiguous or missing. This is captured in `_find_original_candidate`.
+4. **Last-wins on mid-stage re-submission, blocked once past stage.** Candidates can correct a bad Stage 2 while still at Stage 2 — but once they've moved to Stage 3, they can't retroactively improve their Stage 2. The dividing line is `_is_past_stage`.
+5. **Orphan rows are always archived.** Even a blocked or empty merge archives the orphan so the database doesn't fill up with duplicates.
