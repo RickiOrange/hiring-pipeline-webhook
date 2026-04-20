@@ -179,6 +179,7 @@ STAGE_SUBMISSION_SPECS = [
         "label": "Stage 2",
         "score_prop": "Stage 2 Score",
         "stage_task": "Stage 2 Task",
+        "submitted_at_prop": "Stage 2 Submitted At",
         "file_props": [
             "Notion task screenshots",
             "Spreadsheet task screenshots",
@@ -196,6 +197,7 @@ STAGE_SUBMISSION_SPECS = [
         "label": "Stage 3",
         "score_prop": "Stage 3 Score",
         "stage_task": "Stage 3 Task",
+        "submitted_at_prop": "Stage 3 Submitted At",
         "file_props": [],
         "text_props": ["Stage 3 Submission"],
     },
@@ -203,6 +205,7 @@ STAGE_SUBMISSION_SPECS = [
         "label": "Stage 4",
         "score_prop": "Stage 4 Score",
         "stage_task": "Stage 4 Task",
+        "submitted_at_prop": "Stage 4 Submitted At",
         "file_props": [],
         "text_props": ["Stage 4 Submission"],
     },
@@ -210,6 +213,7 @@ STAGE_SUBMISSION_SPECS = [
         "label": "Stage 5",
         "score_prop": "Stage 5 Score",
         "stage_task": "Stage 5 Task",
+        "submitted_at_prop": "Stage 5 Submitted At",
         "file_props": [
             "Stage 5 BTC Screenshot",
             "On-chain transaction screenshot",
@@ -396,6 +400,14 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
     patch_props: dict = {}
     overwritten_props: list[str] = []
 
+    # Stamp the stage's Submitted At property with the orphan's creation time
+    # (= the moment the candidate hit "submit" on the Notion form). Done early
+    # so it's included even if no files/text need patching for some reason.
+    submitted_at_prop = spec.get("submitted_at_prop")
+    orphan_created_at = orphan_page.get("created_time")
+    if submitted_at_prop and orphan_created_at:
+        patch_props[submitted_at_prop] = {"date": {"start": orphan_created_at}}
+
     # --- File properties
     for prop_name in spec["file_props"]:
         src_prop = orphan_props.get(prop_name) or {}
@@ -555,6 +567,19 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
                     "score": None,
                     "reasoning": (f"{label} submission had no payload fields populated "
                                   f"for {merge_result['original_id']}; orphan archived")}
+
+    # Stamp Stage 1 Submitted At with the page's creation time (= moment the
+    # candidate hit submit on the application form). Done only for real Stage 1
+    # applications — stage-submission orphans returned above, so we don't
+    # mistakenly tag them.
+    stage1_submitted_at = page.get("created_time")
+    if stage1_submitted_at:
+        try:
+            patch_page_properties(page_id, {
+                "Stage 1 Submitted At": {"date": {"start": stage1_submitted_at}}
+            })
+        except Exception as e:
+            print(f"  WARN: could not set Stage 1 Submitted At for {page_id}: {e}")
 
     # Idempotency: skip if already scored
     existing_score = page.get("properties", {}).get("AI Score Stage 1", {}).get("number")

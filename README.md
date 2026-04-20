@@ -118,6 +118,15 @@ Normalisation explicitly tolerates trailing whitespace (`"Benzile Makhanya "` in
 
 The ordering is defined by `STAGE_ORDER` in [`pipeline.py`](pipeline.py). `_is_past_stage(props, spec)` returns whether the candidate has progressed beyond the stage the orphan belongs to.
 
+### Submission timestamps
+
+Every merge records **when** the candidate hit submit on the Notion form, not when the scorer ran, so Ricki can see who's been slow or fast through the pipeline.
+
+- **Stage 1 Submitted At** — set from the application page's own `created_time` inside `process_single_stage1`, after the stage-submission detection branch so it's only written for real Stage 1 applications.
+- **Stage 2 / 3 / 4 / 5 Submitted At** — set from the orphan row's `created_time` inside `_merge_stage_submission`, alongside the files/text patch. Each spec in `STAGE_SUBMISSION_SPECS` carries a `submitted_at_prop` naming the target property.
+
+Blocked re-submissions (past-stage game-prevention) do NOT update the timestamp — the earlier legit submission's timestamp is preserved, matching the "their old score just remains as it was" policy. Mid-stage re-submissions (last-wins) DO update it to the newer submission's moment.
+
 ### Log lines to grep in Railway
 
 ```

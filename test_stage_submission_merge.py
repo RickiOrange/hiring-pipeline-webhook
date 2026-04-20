@@ -356,11 +356,29 @@ def test_is_past_stage():
           _stage_order_index("Bogus") == -1)
 
 
+def test_specs_have_submitted_at():
+    print("\n== STAGE_SUBMISSION_SPECS shape ==")
+    required_keys = ("label", "score_prop", "stage_task", "submitted_at_prop",
+                     "file_props", "text_props")
+    for spec in STAGE_SUBMISSION_SPECS:
+        for key in required_keys:
+            check(f"{spec.get('label', '?')}: has '{key}'",
+                  key in spec,
+                  f"keys={list(spec.keys())}")
+        # submitted_at_prop should follow the 'Stage N Submitted At' convention
+        label = spec.get("label", "")
+        expected = f"{label} Submitted At"
+        check(f"{label}: submitted_at_prop = {expected!r}",
+              spec.get("submitted_at_prop") == expected,
+              f"got {spec.get('submitted_at_prop')!r}")
+
+
 def main():
     test_normalize_name()
     test_detect_stage_submission()
     test_find_original_candidate()
     test_is_past_stage()
+    test_specs_have_submitted_at()
 
     print()
     if FAILURES:
