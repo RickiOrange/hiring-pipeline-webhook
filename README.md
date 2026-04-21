@@ -147,6 +147,18 @@ Every merge records **when** the candidate hit submit on the Notion form, not wh
 
 Blocked re-submissions (past-stage game-prevention) do NOT update the timestamp — the earlier legit submission's timestamp is preserved, matching the "their old score just remains as it was" policy. Mid-stage re-submissions (last-wins) DO update it to the newer submission's moment.
 
+### Deadline extensions
+
+Candidates have 7 days from Stage 1 submission to get through all remaining stages. If a candidate requests more time, Ricki grants it by setting the **Extended Deadline** date column on their row in the Candidate Applications database. There's no CLI command and no script — the property is the entire UI.
+
+When `Extended Deadline` is set:
+
+- The `Days Left` formula counts down to that date instead of the default 7-day window. Note that Notion's `dateBetween(..., "days")` returns 24-hour chunks elapsed, so a deadline set mid-day can display one less than a calendar-day subtraction might suggest. The actual expiry behaviour (below) handles this correctly.
+- `run_timeout_check` in [`pipeline.py`](pipeline.py) computes the warning and expiry moments relative to (Extended Deadline + 24 hours) so an end-of-day override honours the full day — a Friday-2026-04-24 override expires at Saturday 00:00 UTC, not Friday 00:00.
+- The warning fires 2 days before expiry (same lead-time as the default behaviour), and Email Action is set to `Timeout Warning` / `Timeout Expired` exactly as without an override.
+
+Leaving `Extended Deadline` empty reverts the candidate to the default behaviour. Clearing it after granting one also reverts immediately.
+
 ### Log lines to grep in Railway
 
 ```
@@ -162,6 +174,10 @@ Blocked re-submissions (past-stage game-prevention) do NOT update the timestamp 
   retaining prior score and data. Orphan archived.
 
 [Stage N unmatched] ... no matching candidate found — left in place for manual review
+
+  TIMEOUT EXPIRED (extended): <name> deadline was YYYY-MM-DD, in Stage N Task
+  TIMEOUT WARNING (extended): <name> deadline is YYYY-MM-DD, in Stage N Task
+  OK (extended to YYYY-MM-DD): <name> in Stage N Task
 ```
 
 ## Directory layout
