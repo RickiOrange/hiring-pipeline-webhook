@@ -1,0 +1,42 @@
+name: Deploy to Railway
+
+# Triggered on every push to main. The Railway service was previously
+# created via `railway init` (NOT "Deploy from GitHub"), so it does not
+# auto-pull from this repo. Without this workflow, commits sit in GitHub
+# until someone manually runs `railway up` from their machine — which is
+# exactly the bug that left Patrick, Mohammed, Christo, and Nakhokonke's
+# stage submissions broken on 2026-04-21.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}  # allows manual re-run from the Actions tab
+
+jobs:
+  deploy:
+    name: Deploy webhook to Railway
+    runs-on: ubuntu-latest
+    # Only one deploy at a time — newer pushes cancel in-flight runs so
+    # we never deploy an older commit on top of a newer one.
+    concurrency:
+      group: railway-deploy
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node (for Railway CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli@latest
+
+      - name: Deploy
+        env:
+          # Project-scoped token stored in repo secrets. Create it at
+          # https://railway.com/project/648eabe8-15b4-4721-93c4-ddd1e9a863c8/settings/tokens
+          # then add as `RAILWAY_TOKEN` under repo Settings → Secrets and variables → Actions.
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --service hiring-pipeline-webhook --ci
