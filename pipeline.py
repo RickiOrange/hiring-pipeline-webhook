@@ -1393,8 +1393,12 @@ def run_timeout_check(config: dict) -> dict:
     - At 5 days: send warning email if not already warned.
     - At 7 days: reject candidate and send expiry email.
     Only applies to candidates in stages 2-5.
+
+    Per-candidate `Extended Deadline` (date property, set manually in Notion)
+    overrides the default window: warnings/expiry are measured relative to
+    (Extended Deadline + 24h) so an end-of-day override honours the full day.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime, timezone, timedelta
 
     db_id = config["notion_database_id"]
     timeout_cfg = config.get("timeout", {})
@@ -1410,7 +1414,7 @@ def run_timeout_check(config: dict) -> dict:
     ]
 
     now = datetime.now(timezone.utc)
-    stats = {"checked": 0, "warned": 0, "expired": 0}
+    stats = {"checked": 0, "warned": 0, "expired": 0, "extended": 0}
 
     for stage_name in active_stages:
         candidates = get_candidates(db_id, stage=stage_name)
@@ -1419,7 +1423,44 @@ def run_timeout_check(config: dict) -> dict:
             candidate = get_candidate_data(page)
             name = candidate["full_name"]
 
-            # Use page created_time as application start timestamp
+            # Read current Email Action to avoid duplicate warnings
+            props = page.get("properties", {})
+            ea_prop = props.get("Email Action", {}).get("select")
+            current_action = ea_prop.get("name") if ea_prop else None
+
+            extended = candidate.get("extended_deadline")
+            if extended:
+                # Manual override: compute relative to end-of-day on the override date.
+                # Date-only strings ("2026-04-24") parse as midnight UTC; +24h gives
+                # "end of that day" in UTC so the candidate has the full day.
+                try:
+                    deadline_at = datetime.fromisoformat(extended.replace("Z", "+00:00"))
+                except ValueError:
+                    print(f"  SKIP {name}: unparseable Extended Deadline {extended!r}")
+                    continue
+                if deadline_at.tzinfo is None:
+                    deadline_at = deadline_at.replace(tzinfo=timezone.utc)
+                deadline_at = deadline_at + timedelta(days=1)
+                warning_at = deadline_at - timedelta(days=2)
+                stats["extended"] += 1
+
+                if now >= deadline_at:
+                    print(f"  TIMEOUT EXPIRED (extended): {name} deadline was {extended}, in {stage_name}")
+                    reject_candidate(
+                        candidate["page_id"],
+                        f"Application timed out: extended deadline {extended} exceeded",
+                    )
+                    set_email_action(candidate["page_id"], "Timeout Expired")
+                    stats["expired"] += 1
+                elif now >= warning_at and current_action != "Timeout Warning":
+                    print(f"  TIMEOUT WARNING (extended): {name} deadline is {extended}, in {stage_name}")
+                    set_email_action(candidate["page_id"], "Timeout Warning")
+                    stats["warned"] += 1
+                else:
+                    print(f"  OK (extended to {extended}): {name} in {stage_name}")
+                continue
+
+            # No override — use the default 7-day window from page creation.
             created_str = page.get("created_time", "")
             if not created_str:
                 print(f"  SKIP {name}: no created_time")
@@ -1427,11 +1468,6 @@ def run_timeout_check(config: dict) -> dict:
 
             created = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
             elapsed_days = (now - created).total_seconds() / 86400
-
-            # Read current Email Action to avoid duplicate warnings
-            props = page.get("properties", {})
-            ea_prop = props.get("Email Action", {}).get("select")
-            current_action = ea_prop.get("name") if ea_prop else None
 
             if elapsed_days >= expiry_days:
                 print(f"  TIMEOUT EXPIRED: {name} ({elapsed_days:.1f} days, in {stage_name})")
@@ -1450,7 +1486,8 @@ def run_timeout_check(config: dict) -> dict:
         time.sleep(0.35)
 
     print(f"\n--- Timeout Check Complete ---")
-    print(f"Checked: {stats['checked']}, Warned: {stats['warned']}, Expired: {stats['expired']}")
+    print(f"Checked: {stats['checked']}, Warned: {stats['warned']}, "
+          f"Expired: {stats['expired']}, With extension: {stats['extended']}")
     return stats
 
 

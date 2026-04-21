@@ -135,6 +135,8 @@ def get_candidate_data(page: dict) -> dict:
         # Stage 5 self-reported amounts (for candidate attribution)
         "stage5_onchain_sats": _get_rich_text(props.get("How many Satoshis did you send on-chain?", {})),
         "stage5_lightning_sats": _get_rich_text(props.get("How many Satoshis did you send via Lightning?", {})),
+        # Deadline extension (manual override of the 7-day timeout window)
+        "extended_deadline": _get_date(props.get("Extended Deadline", {})),
     }
 
 
@@ -271,6 +273,12 @@ def _get_email(prop: dict) -> str | None:
 
 def _get_url(prop: dict) -> str | None:
     return prop.get("url")
+
+
+def _get_date(prop: dict) -> str | None:
+    """Return the start date (ISO string) from a Notion date property, or None."""
+    date = prop.get("date")
+    return date.get("start") if date else None
 
 
 def _make_rich_text_blocks(text: str) -> list[dict]:

@@ -427,6 +427,98 @@ def test_is_past_stage():
           _stage_order_index("Bogus") == -1)
 
 
+def test_extended_deadline_logic():
+    """Test the Extended Deadline branch in run_timeout_check — specifically
+    that the (deadline + 24h) buffer is applied and warning fires 2 days before."""
+    from datetime import datetime, timezone, timedelta
+    print("\n== Extended Deadline logic ==")
+
+    def _evaluate(deadline_str: str, now: datetime) -> str:
+        """Replicate the branch logic from pipeline.run_timeout_check."""
+        try:
+            deadline_at = datetime.fromisoformat(deadline_str.replace("Z", "+00:00"))
+        except ValueError:
+            return "SKIP"
+        if deadline_at.tzinfo is None:
+            deadline_at = deadline_at.replace(tzinfo=timezone.utc)
+        deadline_at = deadline_at + timedelta(days=1)  # end-of-day buffer
+        warning_at = deadline_at - timedelta(days=2)
+        if now >= deadline_at:
+            return "EXPIRED"
+        if now >= warning_at:
+            return "WARNING"
+        return "OK"
+
+    # Reference "now" for deterministic tests: 2026-04-21 14:00 UTC
+    now = datetime(2026, 4, 21, 14, 0, tzinfo=timezone.utc)
+
+    # Benzile-style extension: deadline 2026-04-24 (Friday), now is Tuesday
+    check("Deadline 3 days away (Benzile case) → OK",
+          _evaluate("2026-04-24", now) == "OK",
+          f"got {_evaluate('2026-04-24', now)}")
+
+    # Deadline is today — still within the +24h buffer (not expired), but inside
+    # the 2-day warning window → WARNING
+    check("Deadline today (buffered, but <2d to expiry) → WARNING",
+          _evaluate("2026-04-21", now) == "WARNING",
+          f"got {_evaluate('2026-04-21', now)}")
+
+    # Deadline yesterday — buffer ended at midnight today; now is 14:00 past that → EXPIRED
+    check("Deadline yesterday (buffer expired) → EXPIRED",
+          _evaluate("2026-04-20", now) == "EXPIRED",
+          f"got {_evaluate('2026-04-20', now)}")
+
+    # Deadline tomorrow — warning_at is yesterday 00:00, now is past it → WARNING
+    check("Deadline tomorrow (within 2-day warning window) → WARNING",
+          _evaluate("2026-04-22", now) == "WARNING",
+          f"got {_evaluate('2026-04-22', now)}")
+
+    # Deadline 5 days away — OK
+    check("Deadline 5 days away → OK",
+          _evaluate("2026-04-26", now) == "OK",
+          f"got {_evaluate('2026-04-26', now)}")
+
+    # Unparseable string → SKIP (no exception)
+    check("Invalid deadline string → SKIP, no crash",
+          _evaluate("not-a-date", now) == "SKIP",
+          f"got {_evaluate('not-a-date', now)}")
+
+    # ISO timestamp with time component — behaves the same (start-of-day + 24h)
+    check("Deadline with time component → OK when 3 days away",
+          _evaluate("2026-04-24T00:00:00Z", now) == "OK",
+          f"got {_evaluate('2026-04-24T00:00:00Z', now)}")
+
+
+def test_get_date_helper():
+    """The _get_date helper in notion_client should return None for empty
+    date properties and the start string for populated ones."""
+    print("\n== _get_date helper ==")
+    import notion_client as nc
+
+    check("Empty date prop → None",
+          nc._get_date({}) is None)
+    check("Date prop with date=None → None",
+          nc._get_date({"date": None}) is None)
+    check("Populated date prop → start string",
+          nc._get_date({"date": {"start": "2026-04-24", "end": None}}) == "2026-04-24")
+    check("get_candidate_data returns extended_deadline key",
+          "extended_deadline" in _fake_get_candidate_data_full())
+
+
+def _fake_get_candidate_data_full() -> dict:
+    """Build a minimal Notion page with Extended Deadline set and confirm
+    the real get_candidate_data extracts it."""
+    import notion_client as nc
+    page = {
+        "id": "test-page-id",
+        "properties": {
+            "Full Name": _title_prop("Test Person"),
+            "Extended Deadline": {"date": {"start": "2026-04-24", "end": None}},
+        },
+    }
+    return nc.get_candidate_data(page)
+
+
 def test_specs_have_submitted_at():
     print("\n== STAGE_SUBMISSION_SPECS shape ==")
     required_keys = ("label", "score_prop", "stage_task", "submitted_at_prop",
@@ -449,6 +541,8 @@ def main():
     test_detect_stage_submission()
     test_find_original_candidate()
     test_is_past_stage()
+    test_extended_deadline_logic()
+    test_get_date_helper()
     test_specs_have_submitted_at()
 
     print()
