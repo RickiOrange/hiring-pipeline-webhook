@@ -233,7 +233,23 @@ python run.py --role head_of_sales stage5
 
 # Generate composite ranking across all passers
 python run.py --role head_of_sales rank
+
+# Run the timeout check (warn at 5 days, reject at 7 — respects Extended Deadline overrides)
+python run.py --role head_of_sales timeout
 ```
+
+### Automation schedule (what runs when)
+
+| Trigger | What fires | Where |
+|---|---|---|
+| Candidate submits Stage 1 form → Notion "Page added" automation | `process_single_stage1` → hard filters + AI score | Railway webhook (real-time) |
+| Candidate submits a Stage 2/3/4/5 form → Notion "Page added" | `_detect_stage_submission` → `_merge_stage_submission` merges the orphan into the candidate's original row | Railway webhook (real-time) |
+| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — scores whoever has a fresh submission and rejects anyone past their deadline | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
+| Push to `main` | `railway up --service hiring-pipeline-webhook` deploys the webhook | GitHub Actions ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) |
+
+The scoring cron is idempotent — the per-stage `run_stageN` functions already skip candidates without submissions, so running them every 15 min is cheap (5 Notion queries + zero AI calls on a quiet tick). The workflow runs stages in order (2 → 3 → 4 → 5 → timeout) so a candidate who advances through multiple stages in one tick is fully processed.
+
+**⚠️ The timeout check now runs automatically.** Before the cron, it only ran when invoked manually, so timeouts could sit for days. Now: a candidate past 7 days (or past their `Extended Deadline`) is auto-rejected within 15 minutes of expiry. If you want to grant a last-minute extension, set `Extended Deadline` on their row BEFORE the 15-minute mark.
 
 ### Webhook server (local dev)
 

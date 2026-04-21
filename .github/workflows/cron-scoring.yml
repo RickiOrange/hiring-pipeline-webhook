@@ -1,0 +1,65 @@
+name: Automated scoring + timeout check
+
+# Runs every 15 minutes and on manual dispatch. For each active role,
+# scores Stages 2-5 in sequence then runs the timeout check. Stage 1 is
+# NOT included here — it runs in real-time via the webhook on each new
+# application.
+#
+# The scoring CLI is idempotent (skips candidates without submissions,
+# harmless to run repeatedly) so overlapping runs are safe, but
+# cancel-in-progress trims the queue so we don't pile up.
+#
+# Uses `railway run` to inject the hiring-pipeline-webhook service's
+# environment variables (NOTION_API_KEY, ANTHROPIC_API_KEY, etc.) into
+# the GitHub runner. The Python process then runs on the runner with
+# Railway credentials — no second Railway service required.
+
+on:
+  schedule:
+    # Every 15 minutes, UTC. Note: GitHub Actions scheduled runs are
+    # NOT precise — they can be delayed by several minutes during load.
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  score:
+    name: Score stages 2-5 + timeout check
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cron-scoring
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install Python deps
+        working-directory: ./automation
+        run: pip install -r requirements.txt
+
+      - name: Setup Node (for Railway CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli@latest
+
+      - name: Run scoring + timeout
+        working-directory: ./automation
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          set -e
+          # `railway run` downloads the service's env vars and injects them
+          # into the child process. Runs sequentially so a candidate who
+          # advances through multiple stages in one tick is picked up.
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage2
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage3
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage4
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage5
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales timeout
