@@ -73,12 +73,46 @@ def fake_stage2_orphan(name="Jane Doe", email="jane@example.com"):
 
 
 def fake_stage3_orphan(name="Jane Doe", email="jane@example.com"):
+    """Legacy text-only Stage 3 orphan (covers the path where the form text
+    field is filled directly rather than via file upload)."""
     return {
         "id": "page-s3-orphan-001",
         "properties": {
             "Full Name": _title_prop(name),
             "What is your Email?": _email_prop(email),
             "Stage 3 Submission": _text_prop("my sales process is..."),
+        },
+    }
+
+
+def fake_stage3_file_orphan(name="Jane Doe", email="jane@example.com",
+                            filename="response.docx"):
+    """Stage 3 orphan with the actual form payload: a single uploaded document
+    in 'Upload your task' (which is also a Stage 2 field — disambiguation
+    relies on the candidate's current Stage)."""
+    return {
+        "id": "page-s3-file-orphan-001",
+        "properties": {
+            "Full Name": _title_prop(name),
+            "What is your Email?": _email_prop(email),
+            "Upload your task": _file_prop([filename]),
+        },
+    }
+
+
+def fake_stage4_orphan(name="Jane Doe", email="jane@example.com"):
+    """Stage 4 orphan — 9 separate concept text fields populated, no Stage 1 data."""
+    return {
+        "id": "page-s4-orphan-001",
+        "properties": {
+            "Full Name": _title_prop(name),
+            "What is your Email?": _email_prop(email),
+            "Bitcoin — What is it and how does it work at a high level?":
+                _text_prop("Bitcoin is a decentralized digital currency..."),
+            "Lightning Network — What is it and what problem does it solve?":
+                _text_prop("Lightning enables fast, cheap Bitcoin payments..."),
+            "API — What is an API and how is it used in software?":
+                _text_prop("An API is a contract between two services..."),
         },
     }
 
@@ -210,6 +244,43 @@ def test_detect_stage_submission():
     spec = _detect_stage_submission(c, p["properties"])
     check("Populated original with stage 2 fields → None (Stage 1 data wins)",
           spec is None,
+          f"got {spec['label'] if spec else None}")
+
+    # Stage 4 orphan → Stage 4
+    p = fake_stage4_orphan()
+    c = _fake_get_candidate_data(p)
+    spec = _detect_stage_submission(c, p["properties"])
+    check("Stage 4 orphan (concept fields) → Stage 4",
+          spec is not None and spec["label"] == "Stage 4",
+          f"got {spec['label'] if spec else None}")
+
+    # File-only Stage 3 orphan ("Upload your task") with NO current_stage hint:
+    # Stage 2 file_props also include "Upload your task", so both Stage 2 and
+    # Stage 3 specs match. Without disambiguation we fall back to the latest
+    # spec in the list (Stage 3) — acceptable but not authoritative.
+    p = fake_stage3_file_orphan()
+    c = _fake_get_candidate_data(p)
+    spec = _detect_stage_submission(c, p["properties"])
+    check("File-only orphan, no hint → Stage 3 (latest match wins)",
+          spec is not None and spec["label"] == "Stage 3",
+          f"got {spec['label'] if spec else None}")
+
+    # File-only orphan with current_stage='Stage 2 Task' → Stage 2 (correctly disambiguated)
+    spec = _detect_stage_submission(c, p["properties"], current_stage="Stage 2 Task")
+    check("File-only orphan, hint=Stage 2 Task → Stage 2",
+          spec is not None and spec["label"] == "Stage 2",
+          f"got {spec['label'] if spec else None}")
+
+    # File-only orphan with current_stage='Stage 3 Task' → Stage 3
+    spec = _detect_stage_submission(c, p["properties"], current_stage="Stage 3 Task")
+    check("File-only orphan, hint=Stage 3 Task → Stage 3",
+          spec is not None and spec["label"] == "Stage 3",
+          f"got {spec['label'] if spec else None}")
+
+    # current_stage hint that matches no populated spec → falls back to last match
+    spec = _detect_stage_submission(c, p["properties"], current_stage="Stage 5 Task")
+    check("File-only orphan, hint=Stage 5 Task (no payload for it) → falls back to Stage 3",
+          spec is not None and spec["label"] == "Stage 3",
           f"got {spec['label'] if spec else None}")
 
 

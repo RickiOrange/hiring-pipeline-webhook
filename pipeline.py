@@ -174,6 +174,55 @@ def _stage_order_index(stage_name: str | None) -> int:
         return -1
 
 
+def _extract_file_text(url: str, filename: str) -> str:
+    """Download a file from a (signed) URL and return its plain-text content.
+
+    Supports PDF (via pypdf) and DOCX (via python-docx). Returns "" for any
+    other extension or on any failure — the caller should treat extraction as
+    best-effort.
+
+    Imports are lazy so that environments without pypdf / python-docx still
+    load this module (the merge path falls back to copying the file as-is).
+    """
+    if not url or not filename:
+        return ""
+    ext = filename.lower().rsplit(".", 1)[-1] if "." in filename else ""
+    if ext not in ("pdf", "docx"):
+        return ""
+
+    import io
+    import httpx
+    try:
+        with httpx.Client(timeout=60, follow_redirects=True) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            data = r.content
+    except Exception as e:
+        print(f"  WARN: failed to download {filename} for text extraction: {e}")
+        return ""
+
+    try:
+        if ext == "pdf":
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            parts = [(p.extract_text() or "").strip() for p in reader.pages]
+            return "\n\n".join(p for p in parts if p).strip()
+        if ext == "docx":
+            import docx
+            d = docx.Document(io.BytesIO(data))
+            parts = [p.text for p in d.paragraphs if p.text.strip()]
+            for table in d.tables:
+                for row in table.rows:
+                    cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+            return "\n\n".join(parts).strip()
+    except Exception as e:
+        print(f"  WARN: failed to extract text from {filename}: {e}")
+        return ""
+    return ""
+
+
 STAGE_SUBMISSION_SPECS = [
     {
         "label": "Stage 2",
@@ -194,20 +243,38 @@ STAGE_SUBMISSION_SPECS = [
         ],
     },
     {
+        # Stage 3 form uploads a single document (DOCX/PDF) into "Upload your task".
+        # On merge, we extract the text and write it into "Stage 3 Submission" so
+        # run_stage3 (which only reads the text property) can score it.
         "label": "Stage 3",
         "score_prop": "Stage 3 Score",
         "stage_task": "Stage 3 Task",
         "submitted_at_prop": "Stage 3 Submitted At",
-        "file_props": [],
+        "file_props": ["Upload your task"],
         "text_props": ["Stage 3 Submission"],
+        "extracted_text_target": "Stage 3 Submission",
     },
     {
+        # Stage 4 form has 9 separate text fields (one per concept). On merge, we
+        # concatenate them into the single "Stage 4 Submission" text property
+        # that run_stage4 reads.
         "label": "Stage 4",
         "score_prop": "Stage 4 Score",
         "stage_task": "Stage 4 Task",
         "submitted_at_prop": "Stage 4 Submitted At",
         "file_props": [],
-        "text_props": ["Stage 4 Submission"],
+        "text_props": [
+            "Bitcoin — What is it and how does it work at a high level?",
+            "Lightning Network — What is it and what problem does it solve?",
+            "API — What is an API and how is it used in software?",
+            "Cloud Services — What are cloud services and why do companies use them?",
+            "Web App — What is a web application and how does it differ from a website?",
+            "Front End — What does front end mean in software development?",
+            "Back End — What does back end mean in software development?",
+            "KYC — What is KYC and why is it required?",
+            "KYB — What is KYB and how does it differ from KYC?",
+        ],
+        "concat_text_target": "Stage 4 Submission",
     },
     {
         "label": "Stage 5",
@@ -255,7 +322,8 @@ def _has_payload_for_spec(page_props: dict, spec: dict) -> bool:
     return False
 
 
-def _detect_stage_submission(candidate: dict, page_props: dict) -> dict | None:
+def _detect_stage_submission(candidate: dict, page_props: dict,
+                             current_stage: str | None = None) -> dict | None:
     """If this page looks like an orphan submission from a stage form, return
     the matching spec. Otherwise None.
 
@@ -263,16 +331,24 @@ def _detect_stage_submission(candidate: dict, page_props: dict) -> dict | None:
       - it has no Stage 1 data (no CV / writing / age / experience), AND
       - at least one field in the stage's file_props or text_props is populated.
 
-    If multiple stages match (unlikely but possible — a form accidentally
-    populates fields across stages), the LATEST stage wins so the candidate's
-    most-recent submission is honoured.
+    `current_stage` (the matched original candidate's current Stage value, e.g.
+    "Stage 3 Task") disambiguates when multiple specs match the orphan's
+    payload. Stage 2 and Stage 3 forms both write to "Upload your task", so
+    without this hint we can't tell them apart. With it, we prefer the spec
+    whose `stage_task` equals the candidate's current stage.
+
+    Without `current_stage` (e.g. on first detection before the original is
+    matched), ties fall back to the LATEST stage in the spec list.
     """
     if _has_stage1_data(candidate):
         return None
     matches = [s for s in STAGE_SUBMISSION_SPECS if _has_payload_for_spec(page_props, s)]
     if not matches:
         return None
-    # Take the latest-stage spec (by list order — specs are ordered Stage 2→5)
+    if current_stage:
+        for s in matches:
+            if s["stage_task"] == current_stage:
+                return s
     return matches[-1]
 
 
@@ -448,6 +524,54 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
         if dest_text:
             overwritten_props.append(prop_name)
 
+    # --- Concatenate text_props into a single target (Stage 4: 9 concept fields
+    # → "Stage 4 Submission" so run_stage4 can read it as one blob)
+    concat_target = spec.get("concat_text_target")
+    if concat_target:
+        sections = []
+        for prop_name in spec["text_props"]:
+            src_prop = orphan_props.get(prop_name) or {}
+            t = "".join(rt.get("plain_text", "") for rt in src_prop.get("rich_text", [])).strip()
+            if t:
+                sections.append(f"## {prop_name}\n{t}")
+        if sections:
+            combined = "\n\n".join(sections)
+            dest_rt = (original_props.get(concat_target) or {}).get("rich_text") or []
+            dest_text = "".join(t.get("plain_text", "") for t in dest_rt).strip()
+            patch_props[concat_target] = {"rich_text": _make_rich_text_blocks(combined)}
+            if dest_text and concat_target not in overwritten_props:
+                overwritten_props.append(concat_target)
+
+    # --- Extract text from uploaded file(s) into a target text prop
+    # (Stage 3: DOCX/PDF in "Upload your task" → "Stage 3 Submission" so
+    # run_stage3 can read it). Best-effort: extraction failure is logged
+    # but does not fail the merge.
+    extract_target = spec.get("extracted_text_target")
+    if extract_target:
+        chunks = []
+        for prop_name in spec["file_props"]:
+            for f in (orphan_props.get(prop_name) or {}).get("files", []):
+                ftype = f.get("type")
+                if ftype == "file":
+                    src_url = (f.get("file") or {}).get("url")
+                elif ftype == "external":
+                    src_url = (f.get("external") or {}).get("url")
+                else:
+                    src_url = None
+                fname = f.get("name") or ""
+                if not src_url:
+                    continue
+                extracted = _extract_file_text(src_url, fname)
+                if extracted:
+                    chunks.append(extracted)
+        if chunks:
+            combined = "\n\n".join(chunks)
+            dest_rt = (original_props.get(extract_target) or {}).get("rich_text") or []
+            dest_text = "".join(t.get("plain_text", "") for t in dest_rt).strip()
+            patch_props[extract_target] = {"rich_text": _make_rich_text_blocks(combined)}
+            if dest_text and extract_target not in overwritten_props:
+                overwritten_props.append(extract_target)
+
     # --- Game-prevention: if a re-submission would overwrite existing data
     # AND the candidate has already progressed past this stage, drop the
     # whole merge. The orphan is still archived so the DB stays clean.
@@ -536,15 +660,30 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
     # stage submissions that legitimately carry only task payloads.
     spec = _detect_stage_submission(candidate, page.get("properties", {}))
     if spec:
-        label = spec["label"]
-        print(f"[{label} submission detected] page={page_id} name={name!r} email={email!r}")
+        provisional_label = spec["label"]
+        print(f"[{provisional_label} submission provisionally detected] "
+              f"page={page_id} name={name!r} email={email!r}")
         original = _find_original_candidate(name, email, db_id, exclude_page_id=page_id)
         if not original:
-            msg = (f"{label} submission for name={name!r} email={email!r} but no matching "
+            msg = (f"{provisional_label} submission for name={name!r} email={email!r} but no matching "
                    f"candidate found — left in place for manual review")
-            print(f"  [{label} unmatched] {msg}")
-            return {"page_id": page_id, "name": name, "decision": f"{label} unmatched",
+            print(f"  [{provisional_label} unmatched] {msg}")
+            return {"page_id": page_id, "name": name, "decision": f"{provisional_label} unmatched",
                     "score": None, "reasoning": msg}
+        # Re-run detection with the original's current Stage so Stage 2 vs
+        # Stage 3 (which both write to "Upload your task") resolves correctly.
+        # Falls back to the provisional spec if no better match exists.
+        original_stage = (
+            (original.get("properties", {}).get("Stage") or {}).get("select") or {}
+        ).get("name")
+        refined = _detect_stage_submission(
+            candidate, page.get("properties", {}), current_stage=original_stage,
+        )
+        if refined and refined["label"] != provisional_label:
+            print(f"  [disambiguated {provisional_label} → {refined['label']}] "
+                  f"candidate is at {original_stage!r}")
+        spec = refined or spec
+        label = spec["label"]
         merge_result = _merge_stage_submission(page, original, spec)
         if merge_result.get("blocked_reason") == "past_stage":
             reasoning = (f"{label} re-submission blocked: candidate already at "
