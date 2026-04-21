@@ -68,7 +68,7 @@ Each stage form writes to the same Candidate Applications database. Full Name an
 
 ### Detection
 
-[`pipeline.py`](pipeline.py) defines `STAGE_SUBMISSION_SPECS` — a table of which file and text properties belong to each stage:
+[`pipeline.py`](pipeline.py) defines `STAGE_SUBMISSION_SPECS` — a table of which file and text properties belong to each stage, plus optional post-merge text-shaping hooks:
 
 ```python
 STAGE_SUBMISSION_SPECS = [
@@ -76,15 +76,33 @@ STAGE_SUBMISSION_SPECS = [
         "label": "Stage 2",
         "score_prop": "Stage 2 Score",
         "stage_task": "Stage 2 Task",
-        "file_props": [...],   # screenshots
-        "text_props": [...],   # email-draft text fields
+        "file_props": [...],   # screenshots + Upload your task
+        "text_props": [...],   # email-draft text fields + Stage 2 Submission
     },
-    {"label": "Stage 3", ...},
-    ...
+    {
+        "label": "Stage 3",
+        "file_props": ["Upload your task"],
+        "text_props": ["Stage 3 Submission"],
+        "extracted_text_target": "Stage 3 Submission",  # extract DOCX/PDF text into this prop
+    },
+    {
+        "label": "Stage 4",
+        "file_props": [],
+        "text_props": [<the 9 concept questions>],
+        "concat_text_target": "Stage 4 Submission",     # concat the 9 fields into this prop
+    },
+    {"label": "Stage 5", ...},
 ]
 ```
 
-`_detect_stage_submission(candidate, props)` returns the matching spec if the incoming page has **no Stage 1 data** (no CV, writing test, age, experience) and **at least one** of the spec's fields populated. If so, the webhook branches into the merge path **before** Stage 1 hard filters run — so a legitimate Stage 2 submission is never rejected for missing a CV.
+`_detect_stage_submission(candidate, props, current_stage=None)` returns the matching spec if the incoming page has **no Stage 1 data** (no CV, writing test, age, experience) and **at least one** of the spec's fields populated. If so, the webhook branches into the merge path **before** Stage 1 hard filters run — so a legitimate Stage 2 submission is never rejected for missing a CV.
+
+**Disambiguation by current Stage.** Stage 2 and Stage 3 forms both write to `Upload your task`, so an orphan with only that field could belong to either. The webhook calls `_detect_stage_submission` twice: first for a provisional spec (used to find the original candidate), then again with the original's current `Stage` value as a hint. The hint causes the detector to prefer the spec whose `stage_task` matches the candidate's actual progression — Stage 2 form for a candidate at "Stage 2 Task", Stage 3 form for a candidate at "Stage 3 Task". The disambiguation is logged as `[disambiguated Stage X → Stage Y]`.
+
+**Text shaping at merge time.** Two optional spec keys reshape the orphan's payload into the property the per-stage scorer reads:
+
+- `extracted_text_target` — Stage 3's form uploads a DOCX or PDF. The merger downloads the file, runs PDF/DOCX text extraction (`pypdf` / `python-docx`), and writes the result into the named property. `run_stage3` then sees the submission as plain text in `Stage 3 Submission` and scores it normally. Extraction is best-effort; failures log `WARN` but do not block the merge.
+- `concat_text_target` — Stage 4's form has 9 separate concept text fields. The merger concatenates them (with `## <prop name>` headers between sections) into the named property so `run_stage4` can score the submission as one blob.
 
 ### Matching (who does this submission belong to?)
 
@@ -103,7 +121,9 @@ Normalisation explicitly tolerates trailing whitespace (`"Benzile Makhanya "` in
 1. Downloads each file from the orphan's signed S3 URL.
 2. Re-uploads it via Notion's `file_uploads` API (signed URLs expire; re-upload makes the files permanent on the target page).
 3. Copies text properties across.
-4. Archives the orphan row.
+4. If the spec has `concat_text_target`, concatenates `text_props` into that single property.
+5. If the spec has `extracted_text_target`, downloads the file(s) in `file_props`, extracts PDF/DOCX text, and writes it into that property.
+6. Archives the orphan row.
 
 ### Re-submission policy
 
@@ -135,6 +155,8 @@ Blocked re-submissions (past-stage game-prevention) do NOT update the timestamp 
 
 [Stage N re-submission] replaced prior values on <id> for: [...]
 [Stage N re-submission] cleared score + AI writeup; reverted Stage to 'Stage N Task'
+
+[disambiguated Stage X → Stage Y] candidate is at 'Stage Y Task'
 
 [Stage N re-submission BLOCKED] candidate is at 'Stage M Task' (past 'Stage N Task');
   retaining prior score and data. Orphan archived.
