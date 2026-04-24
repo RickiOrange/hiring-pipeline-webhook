@@ -627,6 +627,26 @@ def _merge_stage_submission(orphan_page: dict, original_page: dict, spec: dict) 
     }
 
 
+def _score_single_stage(label: str, config: dict) -> None:
+    """Run the per-stage scorer for `label` (e.g. "Stage 2"…"Stage 5").
+
+    The scorers iterate over every candidate currently at the stage, but in
+    practice that's usually just the one who just submitted — others have
+    either already been scored (idempotent skip) or aren't there yet.
+    """
+    dispatch = {
+        "Stage 2": run_stage2,
+        "Stage 3": run_stage3,
+        "Stage 4": run_stage4,
+        "Stage 5": run_stage5,
+    }
+    fn = dispatch.get(label)
+    if fn is None:
+        print(f"  WARN: no scorer registered for {label!r}; skipping inline scoring")
+        return
+    fn(config)
+
+
 def process_single_stage1(page_id: str, config: dict) -> dict:
     """Process a single candidate through Stage 1 (hard filters + AI evaluation).
 
@@ -694,6 +714,15 @@ def process_single_stage1(page_id: str, config: dict) -> dict:
         if merge_result.get("merged"):
             print(f"  Merged into {merge_result['original_id']} "
                   f"(fields: {merge_result['fields_merged']})")
+            # Score immediately — GitHub Actions scheduled runs are unreliable
+            # (often delayed 1-3 hours). Running inline means candidates see
+            # their result within seconds of hitting Submit. If scoring errors,
+            # the next cron run still catches them (the scorers are idempotent).
+            try:
+                _score_single_stage(label, config)
+            except Exception as e:
+                print(f"  WARN: inline {label} scoring failed ({e}); "
+                      f"next cron run will retry")
             reasoning = f"Merged {label} submission into {merge_result['original_id']}; orphan archived"
             if merge_result.get("fields_overwritten"):
                 reasoning += (f" (re-submission: overwrote {merge_result['fields_overwritten']}; "
