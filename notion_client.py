@@ -142,7 +142,7 @@ def get_candidate_data(page: dict) -> dict:
         # Stage 5 self-reported amounts (for candidate attribution)
         "stage5_onchain_sats": _get_rich_text(props.get("How many Satoshis did you send on-chain?", {})),
         "stage5_lightning_sats": _get_rich_text(props.get("How many Satoshis did you send via Lightning?", {})),
-        # Deadline extension (manual override of the 7-day timeout window)
+        # Deadline extension (manual override of the default timeout window)
         "extended_deadline": _get_date(props.get("Extended Deadline", {})),
     }
 

@@ -1417,11 +1417,13 @@ def run_stage5(config: dict) -> dict:
 # --- Timeout Check ---
 
 def run_timeout_check(config: dict) -> dict:
-    """Check active candidates for 7-day timeout since application creation.
+    """Check active candidates for the application timeout (default 14 days
+    from Stage 1 submission).
 
-    - At 5 days: send warning email if not already warned.
-    - At 7 days: reject candidate and send expiry email.
-    Only applies to candidates in stages 2-5.
+    Window is read from `config["timeout"]["expiry_days"]` and
+    `config["timeout"]["warning_days"]`; the default file ships at
+    `expiry_days: 14, warning_days: 12` so candidates get the warning two
+    days before they expire. Only applies to candidates in stages 2-5.
 
     Per-candidate `Extended Deadline` (date property, set manually in Notion)
     overrides the default window: warnings/expiry are measured relative to
@@ -1431,8 +1433,8 @@ def run_timeout_check(config: dict) -> dict:
 
     db_id = config["notion_database_id"]
     timeout_cfg = config.get("timeout", {})
-    warning_days = timeout_cfg.get("warning_days", 5)
-    expiry_days = timeout_cfg.get("expiry_days", 7)
+    warning_days = timeout_cfg.get("warning_days", 12)
+    expiry_days = timeout_cfg.get("expiry_days", 14)
     stages = config["stages"]
 
     active_stages = [
@@ -1489,7 +1491,7 @@ def run_timeout_check(config: dict) -> dict:
                     print(f"  OK (extended to {extended}): {name} in {stage_name}")
                 continue
 
-            # No override — use the default 7-day window from page creation.
+            # No override — use the configured window from page creation.
             created_str = page.get("created_time", "")
             if not created_str:
                 print(f"  SKIP {name}: no created_time")
@@ -1500,7 +1502,10 @@ def run_timeout_check(config: dict) -> dict:
 
             if elapsed_days >= expiry_days:
                 print(f"  TIMEOUT EXPIRED: {name} ({elapsed_days:.1f} days, in {stage_name})")
-                reject_candidate(candidate["page_id"], "Application timed out: 7-day deadline exceeded")
+                reject_candidate(
+                    candidate["page_id"],
+                    f"Application timed out: {expiry_days}-day deadline exceeded",
+                )
                 set_email_action(candidate["page_id"], "Timeout Expired")
                 stats["expired"] += 1
 

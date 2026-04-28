@@ -30,8 +30,8 @@ max_scores:
 min_finalists: 5
 
 timeout:
-  warning_days: 5
-  expiry_days: 7
+  warning_days: 12
+  expiry_days: 14
 
 stages:
   applied: "Applied"

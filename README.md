@@ -149,11 +149,11 @@ Blocked re-submissions (past-stage game-prevention) do NOT update the timestamp 
 
 ### Deadline extensions
 
-Candidates have 7 days from Stage 1 submission to get through all remaining stages. If a candidate requests more time, Ricki grants it by setting the **Extended Deadline** date column on their row in the Candidate Applications database. There's no CLI command and no script — the property is the entire UI.
+Candidates have 14 days from Stage 1 submission to get through all remaining stages. (The window was 7 days through 2026-04-28; extended to 14 to give candidates more breathing room — `config/head_of_sales.yaml` is the source of truth.) If a candidate requests more time, Ricki grants it by setting the **Extended Deadline** date column on their row in the Candidate Applications database. There's no CLI command and no script — the property is the entire UI.
 
 When `Extended Deadline` is set:
 
-- The `Days Left` formula counts down to that date instead of the default 7-day window. Note that Notion's `dateBetween(..., "days")` returns 24-hour chunks elapsed, so a deadline set mid-day can display one less than a calendar-day subtraction might suggest. The actual expiry behaviour (below) handles this correctly.
+- The `Days Left` formula counts down to that date instead of the default 14-day window. Note that Notion's `dateBetween(..., "days")` returns 24-hour chunks elapsed, so a deadline set mid-day can display one less than a calendar-day subtraction might suggest. The actual expiry behaviour (below) handles this correctly.
 - `run_timeout_check` in [`pipeline.py`](pipeline.py) computes the warning and expiry moments relative to (Extended Deadline + 24 hours) so an end-of-day override honours the full day — a Friday-2026-04-24 override expires at Saturday 00:00 UTC, not Friday 00:00.
 - The warning fires 2 days before expiry (same lead-time as the default behaviour), and Email Action is set to `Timeout Warning` / `Timeout Expired` exactly as without an override.
 
@@ -244,12 +244,12 @@ python run.py --role head_of_sales timeout
 |---|---|---|
 | Candidate submits Stage 1 form → Notion "Page added" automation | `process_single_stage1` → hard filters + AI score | Railway webhook (real-time) |
 | Candidate submits a Stage 2/3/4/5 form → Notion "Page added" | `_detect_stage_submission` → `_merge_stage_submission` merges the orphan into the candidate's original row, then `_score_single_stage` runs the matching per-stage scorer **inline** so the candidate sees their result within seconds | Railway webhook (real-time) |
-| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — safety-net retry for any submission whose inline scoring failed, plus the 7-day timeout sweep | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
+| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — safety-net retry for any submission whose inline scoring failed, plus the 14-day timeout sweep | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
 | Push to `main` | `railway up --service hiring-pipeline-webhook` deploys the webhook | GitHub Actions ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) |
 
 The cron is a safety net, not the primary path. GitHub Actions scheduled runs are unreliable in practice — we've observed 40-min to 3-hour gaps despite the 15-min cron — so per-stage scoring runs **inline on the webhook** the moment a submission is merged. If inline scoring throws, the webhook still acks the merge and the next cron tick picks the candidate up; `run_stageN` is idempotent (skips anyone already scored), so re-runs are cheap.
 
-**⚠️ The timeout check now runs automatically.** Before the cron, it only ran when invoked manually, so timeouts could sit for days. Now: a candidate past 7 days (or past their `Extended Deadline`) is auto-rejected within 15 minutes of expiry. If you want to grant a last-minute extension, set `Extended Deadline` on their row BEFORE the 15-minute mark.
+**⚠️ The timeout check now runs automatically.** Before the cron, it only ran when invoked manually, so timeouts could sit for days. Now: a candidate past 14 days (or past their `Extended Deadline`) is auto-rejected within 15 minutes of expiry. If you want to grant a last-minute extension, set `Extended Deadline` on their row BEFORE the 15-minute mark.
 
 ### Webhook server (local dev)
 
