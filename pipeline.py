@@ -1525,6 +1525,248 @@ def run_timeout_check(config: dict) -> dict:
     return stats
 
 
+# --- Pipeline Health Check ---
+#
+# Auto-detect stuck submissions and unscored work. Runs as the last step of
+# the cron after stages 2-5 + timeout, so any issue created during those
+# stages gets caught the same tick. Anything we can't auto-fix lands on the
+# `Pipeline Issue` rich-text property — Ricki has a Notion view filtered on
+# "Pipeline Issue is not empty" that surfaces them.
+
+PIPELINE_ISSUE_PROP = "Pipeline Issue"
+HEALTH_CHECK_GRACE_MINUTES = 5  # how long after submission to wait before flagging unscored
+
+
+def _set_pipeline_issue(page_id: str, issue: str | None) -> None:
+    """Write or clear the Pipeline Issue property on a candidate row."""
+    if issue:
+        rich = [{"type": "text", "text": {"content": issue[:1900]}}]
+        patch_page_properties(page_id, {PIPELINE_ISSUE_PROP: {"rich_text": rich}})
+    else:
+        patch_page_properties(page_id, {PIPELINE_ISSUE_PROP: {"rich_text": []}})
+
+
+def _existing_pipeline_issue(page: dict) -> str:
+    rt = (page.get("properties", {}).get(PIPELINE_ISSUE_PROP) or {}).get("rich_text") or []
+    return "".join(t.get("plain_text", "") for t in rt).strip()
+
+
+def run_health_check(config: dict) -> dict:
+    """Detect stuck submissions; auto-fix where safe, flag the rest.
+
+    Four scans:
+      A. Orphan rows (no CV / no Stage 1 score / no age) carrying submission
+         payload → re-run process_single_stage1 to merge them.
+      B. Rejected candidates with a Stage N submission timestamp but no
+         Stage N score → flag for manual review (we don't auto-revive
+         a rejected candidate).
+      C. Candidates at "Stage N Task" with a Stage N submission >5 min old
+         and no Stage N score → call the per-stage scorer once (it's
+         idempotent). Re-check; if still unscored, flag.
+      D. Candidates at "Stage N Task" (N≥3) with no Stage N-1 score → flag
+         broken progression unless their AI Reasoning records a manual
+         override or revival.
+
+    Anything currently flagged that no longer matches a condition gets its
+    `Pipeline Issue` cleared.
+    """
+    db_id = config["notion_database_id"]
+
+    print("\n=== Pipeline Health Check ===")
+    all_pages = get_candidates(db_id)
+
+    issues: dict[str, str] = {}        # page_id -> issue text
+    orphan_ids: list[str] = []
+    needs_rescore: dict[int, list[str]] = {}  # stage_n -> [page_ids]
+
+    now_utc = _utcnow_for_health()
+
+    for page in all_pages:
+        pr = page.get("properties", {})
+        page_id = page["id"]
+        if page.get("archived") or page.get("in_trash"):
+            continue
+        candidate = get_candidate_data(page)
+        name = candidate.get("full_name") or "(no name)"
+        cv_count = len(candidate.get("cv_upload") or [])
+        stage1_score = (pr.get("AI Score Stage 1") or {}).get("number")
+        age_select = (pr.get("How old are you?") or {}).get("select")
+        stage_select = (pr.get("Stage") or {}).get("select") or {}
+        stage = stage_select.get("name")
+
+        # A. Orphan
+        is_orphan = (cv_count == 0 and stage1_score is None and not age_select)
+        if is_orphan:
+            # Check it has a submission-shape payload — otherwise skip (might
+            # just be a manually-created blank row)
+            if _has_any_stage_payload(pr):
+                orphan_ids.append(page_id)
+                continue  # we'll process orphans as a batch below
+
+        # B. Rejected with submission but no score
+        if stage == "Rejected":
+            for n in (2, 3, 4, 5):
+                submitted = ((pr.get(f"Stage {n} Submitted At") or {}).get("date") or {}).get("start")
+                score = (pr.get(f"Stage {n} Score") or {}).get("number")
+                if submitted and score is None:
+                    issues[page_id] = (f"Rejected candidate has unscored Stage {n} submission "
+                                       f"({submitted}). Manual review: revive or confirm rejection.")
+                    break
+            continue
+
+        # C. Stage N Task with stale unscored submission
+        if stage and "Task" in stage:
+            try:
+                n = int(stage.split(" ")[1])
+            except (IndexError, ValueError):
+                n = None
+            if n is not None and 2 <= n <= 5:
+                submitted = ((pr.get(f"Stage {n} Submitted At") or {}).get("date") or {}).get("start")
+                score = (pr.get(f"Stage {n} Score") or {}).get("number")
+                if submitted and score is None:
+                    age_min = _minutes_since(submitted, now_utc)
+                    if age_min is not None and age_min > HEALTH_CHECK_GRACE_MINUTES:
+                        needs_rescore.setdefault(n, []).append(page_id)
+                        # We'll set/clear the issue after re-scoring below
+
+                # D. Broken progression (only flag once we've confirmed C didn't trigger)
+                if n >= 3 and (pr.get(f"Stage {n-1} Score") or {}).get("number") is None:
+                    reasoning = "".join(
+                        t.get("plain_text", "") for t in (pr.get("AI Reasoning") or {}).get("rich_text", [])
+                    )
+                    if "MANUAL OVERRIDE" not in reasoning and "Revived" not in reasoning:
+                        issues.setdefault(
+                            page_id,
+                            f"At {stage} but no Stage {n-1} Score (broken progression).",
+                        )
+
+    # --- Auto-fix: re-process orphans
+    fixed_orphans = 0
+    unmatched_orphans: list[str] = []
+    for orphan_id in orphan_ids:
+        try:
+            result = process_single_stage1(orphan_id, config)
+            decision = result.get("decision", "")
+            if "unmatched" in decision:
+                unmatched_orphans.append(orphan_id)
+                issues[orphan_id] = (f"Unmatched submission orphan: "
+                                     f"name={result.get('name')!r}. "
+                                     f"No candidate record found by name or email.")
+            elif "merged" in decision:
+                fixed_orphans += 1
+            elif "blocked" in decision:
+                issues[orphan_id] = result.get("reasoning", "Submission blocked")
+        except Exception as e:
+            issues[orphan_id] = f"Orphan re-process raised: {type(e).__name__}: {e}"
+
+    # --- Auto-fix: re-score stale active stages (idempotent per-stage scorers)
+    rescored_stages: list[int] = []
+    for n in sorted(needs_rescore.keys()):
+        scorer = {2: run_stage2, 3: run_stage3, 4: run_stage4, 5: run_stage5}.get(n)
+        if not scorer:
+            continue
+        print(f"\n[health] Stage {n} has {len(needs_rescore[n])} unscored submission(s) — rescoring")
+        try:
+            scorer(config)
+            rescored_stages.append(n)
+        except Exception as e:
+            for pid in needs_rescore[n]:
+                issues[pid] = f"Stage {n} re-score raised: {type(e).__name__}: {e}"
+
+    # Re-check the rescored candidates after the run — anything still without
+    # a score gets flagged.
+    for n, page_ids in needs_rescore.items():
+        if n not in rescored_stages:
+            continue
+        for pid in page_ids:
+            try:
+                refreshed = get_page(pid)
+            except Exception:
+                continue
+            score = (refreshed.get("properties", {}).get(f"Stage {n} Score") or {}).get("number")
+            if score is None and pid not in issues:
+                submitted = ((refreshed.get("properties", {}).get(f"Stage {n} Submitted At") or {}).get("date") or {}).get("start")
+                issues[pid] = (f"Stage {n} submission ({submitted}) still unscored after a "
+                               f"retry — investigate the scorer or the submission shape.")
+
+    # --- Sync the Pipeline Issue property: write new, clear resolved
+    flagged_count = 0
+    cleared_count = 0
+    for page in all_pages:
+        page_id = page["id"]
+        existing = _existing_pipeline_issue(page)
+        new = issues.get(page_id, "")
+        if new and existing != new:
+            try:
+                _set_pipeline_issue(page_id, new)
+                flagged_count += 1
+            except Exception as e:
+                print(f"  WARN: could not set Pipeline Issue on {page_id}: {e}")
+        elif not new and existing:
+            try:
+                _set_pipeline_issue(page_id, None)
+                cleared_count += 1
+            except Exception as e:
+                print(f"  WARN: could not clear Pipeline Issue on {page_id}: {e}")
+
+    # Summary
+    print(f"\n--- Health Check Complete ---")
+    print(f"Orphans found: {len(orphan_ids)} ({fixed_orphans} merged, {len(unmatched_orphans)} unmatched)")
+    print(f"Stages re-scored: {sorted(rescored_stages)}")
+    print(f"Pipeline issues now flagged: {flagged_count}")
+    print(f"Pipeline issues cleared: {cleared_count}")
+    if issues:
+        print(f"\nCurrently flagged ({len(issues)}):")
+        for pid, msg in issues.items():
+            print(f"  ⚠ {pid}: {msg}")
+    return {
+        "orphans_found": len(orphan_ids),
+        "orphans_fixed": fixed_orphans,
+        "orphans_unmatched": len(unmatched_orphans),
+        "stages_rescored": sorted(rescored_stages),
+        "flagged": len(issues),
+        "cleared": cleared_count,
+    }
+
+
+def _has_any_stage_payload(props: dict) -> bool:
+    """True if the row carries any per-stage submission file or text."""
+    file_props = [
+        "Notion task screenshots", "Spreadsheet task screenshots",
+        "Presentation task screenshots (each slide)", "Upload your task",
+        "On-chain transaction screenshot", "Lightning payment screenshot",
+        "Stage 5 BTC Screenshot", "Stage 5 Lightning Screenshot",
+    ]
+    text_props = [
+        "Stage 3 Submission", "Stage 4 Submission",
+        "A.I. email draft (3/3) - edited version",
+        "On-chain transaction ID", "Lightning transaction proof of payment",
+        "Bitcoin — What is it and how does it work at a high level?",
+    ]
+    for k in file_props:
+        if (props.get(k) or {}).get("files"):
+            return True
+    for k in text_props:
+        rt = (props.get(k) or {}).get("rich_text") or []
+        if "".join(t.get("plain_text", "") for t in rt).strip():
+            return True
+    return False
+
+
+def _utcnow_for_health():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def _minutes_since(iso_ts: str, now_dt) -> float | None:
+    from datetime import datetime
+    try:
+        dt = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+        return (now_dt - dt).total_seconds() / 60
+    except Exception:
+        return None
+
+
 # --- Final Ranking ---
 
 def run_ranking(config: dict) -> dict:

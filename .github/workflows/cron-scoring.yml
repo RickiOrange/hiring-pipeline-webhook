@@ -61,3 +61,8 @@ jobs:
           railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage4
           railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales stage5
           railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales timeout
+          # Health check runs LAST so it catches anything the stage scorers
+          # didn't manage to score this tick (orphans, rejected-with-submission,
+          # broken progressions). Auto-fixes what it can; flags the rest on
+          # the candidate's `Pipeline Issue` column for manual review.
+          railway run --service hiring-pipeline-webhook -- python run.py --role head_of_sales health

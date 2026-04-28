@@ -17,6 +17,7 @@ import sys
 from pipeline import (
     load_config, run_stage1, run_stage2, run_stage3,
     run_stage4, run_stage5, run_ranking, run_timeout_check,
+    run_health_check,
 )
 
 
@@ -29,7 +30,7 @@ def main():
     )
     parser.add_argument(
         "stage",
-        choices=["stage1", "stage2", "stage3", "stage4", "stage5", "rank", "timeout"],
+        choices=["stage1", "stage2", "stage3", "stage4", "stage5", "rank", "timeout", "health"],
         help="Pipeline stage to run",
     )
     args = parser.parse_args()
@@ -60,6 +61,8 @@ def main():
         run_ranking(config)
     elif args.stage == "timeout":
         run_timeout_check(config)
+    elif args.stage == "health":
+        run_health_check(config)
 
 
 if __name__ == "__main__":
