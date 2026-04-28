@@ -64,7 +64,14 @@ def get_candidate_data(page: dict) -> dict:
         "page_id": page["id"],
         # Basic info
         "full_name": _get_title(props.get("Full Name", {})),
-        "email": _get_email(props.get("What is your Email?", {})),
+        # Stage 1 form writes to "What is your Email?"; the Stage 2-5 submission
+        # forms write to plain "Email". Prefer the Stage 1 field on real
+        # candidate rows (it's required there); fall back to "Email" so that
+        # orphan submission rows still expose an email for matcher fallback.
+        "email": (
+            _get_email(props.get("What is your Email?", {}))
+            or _get_email(props.get("Email", {}))
+        ),
         "linkedin": _get_url(props.get("LinkedIn profile", {})),
         "cv_upload": _get_files(props.get("Upload your CV", {})),
         # Demographics
@@ -347,7 +354,17 @@ def transfer_file_to_notion(source_url: str, filename: str) -> dict:
         )
         send.raise_for_status()
 
-    return {"type": "file_upload", "file_upload": {"id": fu_id}, "name": filename}
+    # Notion enforces a 100-char limit on file-property entry names. Truncate
+    # but preserve the extension so the file still opens with the right viewer.
+    display_name = filename
+    if len(display_name) > 100:
+        base, dot, ext = display_name.rpartition(".")
+        if dot and len(ext) <= 10:
+            display_name = base[: 100 - len(ext) - 1] + "." + ext
+        else:
+            display_name = display_name[:100]
+
+    return {"type": "file_upload", "file_upload": {"id": fu_id}, "name": display_name}
 
 
 def archive_page(page_id: str) -> dict:
