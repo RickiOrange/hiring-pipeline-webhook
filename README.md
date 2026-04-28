@@ -243,11 +243,11 @@ python run.py --role head_of_sales timeout
 | Trigger | What fires | Where |
 |---|---|---|
 | Candidate submits Stage 1 form → Notion "Page added" automation | `process_single_stage1` → hard filters + AI score | Railway webhook (real-time) |
-| Candidate submits a Stage 2/3/4/5 form → Notion "Page added" | `_detect_stage_submission` → `_merge_stage_submission` merges the orphan into the candidate's original row | Railway webhook (real-time) |
-| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — scores whoever has a fresh submission and rejects anyone past their deadline | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
+| Candidate submits a Stage 2/3/4/5 form → Notion "Page added" | `_detect_stage_submission` → `_merge_stage_submission` merges the orphan into the candidate's original row, then `_score_single_stage` runs the matching per-stage scorer **inline** so the candidate sees their result within seconds | Railway webhook (real-time) |
+| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — safety-net retry for any submission whose inline scoring failed, plus the 7-day timeout sweep | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
 | Push to `main` | `railway up --service hiring-pipeline-webhook` deploys the webhook | GitHub Actions ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) |
 
-The scoring cron is idempotent — the per-stage `run_stageN` functions already skip candidates without submissions, so running them every 15 min is cheap (5 Notion queries + zero AI calls on a quiet tick). The workflow runs stages in order (2 → 3 → 4 → 5 → timeout) so a candidate who advances through multiple stages in one tick is fully processed.
+The cron is a safety net, not the primary path. GitHub Actions scheduled runs are unreliable in practice — we've observed 40-min to 3-hour gaps despite the 15-min cron — so per-stage scoring runs **inline on the webhook** the moment a submission is merged. If inline scoring throws, the webhook still acks the merge and the next cron tick picks the candidate up; `run_stageN` is idempotent (skips anyone already scored), so re-runs are cheap.
 
 **⚠️ The timeout check now runs automatically.** Before the cron, it only ran when invoked manually, so timeouts could sit for days. Now: a candidate past 7 days (or past their `Extended Deadline`) is auto-rejected within 15 minutes of expiry. If you want to grant a last-minute extension, set `Extended Deadline` on their row BEFORE the 15-minute mark.
 
