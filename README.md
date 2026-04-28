@@ -244,12 +244,25 @@ python run.py --role head_of_sales timeout
 |---|---|---|
 | Candidate submits Stage 1 form → Notion "Page added" automation | `process_single_stage1` → hard filters + AI score | Railway webhook (real-time) |
 | Candidate submits a Stage 2/3/4/5 form → Notion "Page added" | `_detect_stage_submission` → `_merge_stage_submission` merges the orphan into the candidate's original row, then `_score_single_stage` runs the matching per-stage scorer **inline** so the candidate sees their result within seconds | Railway webhook (real-time) |
-| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check` — safety-net retry for any submission whose inline scoring failed, plus the 14-day timeout sweep | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
+| Every 15 minutes (UTC) | `run_stage2`, `run_stage3`, `run_stage4`, `run_stage5`, `run_timeout_check`, `run_health_check` — safety-net retry for any submission whose inline scoring failed, the 14-day timeout sweep, and the stuck-submission detector | GitHub Actions scheduled workflow ([`.github/workflows/cron-scoring.yml`](.github/workflows/cron-scoring.yml)) |
 | Push to `main` | `railway up --service hiring-pipeline-webhook` deploys the webhook | GitHub Actions ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) |
 
 The cron is a safety net, not the primary path. GitHub Actions scheduled runs are unreliable in practice — we've observed 40-min to 3-hour gaps despite the 15-min cron — so per-stage scoring runs **inline on the webhook** the moment a submission is merged. If inline scoring throws, the webhook still acks the merge and the next cron tick picks the candidate up; `run_stageN` is idempotent (skips anyone already scored), so re-runs are cheap.
 
 **⚠️ The timeout check now runs automatically.** Before the cron, it only ran when invoked manually, so timeouts could sit for days. Now: a candidate past 14 days (or past their `Extended Deadline`) is auto-rejected within 15 minutes of expiry. If you want to grant a last-minute extension, set `Extended Deadline` on their row BEFORE the 15-minute mark.
+
+### Stuck-submission detector (`run_health_check`)
+
+This runs as the last cron step every 15 min. It scans every candidate row and looks for the symptoms of a stuck submission, regardless of which underlying bug caused it:
+
+- **Orphans** — un-merged form submissions still sitting in the DB → re-runs `process_single_stage1`.
+- **Rejected with unscored submission** — submission timestamp set, score still empty → flags for manual review (we don't auto-revive a rejected candidate).
+- **Stage N Task with stale unscored submission** — submitted >5 min ago, no score → calls the per-stage scorer once (idempotent). If still unscored after the retry, flags.
+- **Broken progression** — at Stage N Task with no Stage N-1 score, and no manual override note in AI Reasoning → flags.
+
+Anything we can't auto-fix lands on the `Pipeline Issue` rich-text column on the Candidate Applications database. Build a Notion view filtered on `Pipeline Issue is not empty` to see them at a glance — the flag self-clears once the issue resolves.
+
+Run on demand: `python run.py --role head_of_sales health`
 
 ### Webhook server (local dev)
 
