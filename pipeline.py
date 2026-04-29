@@ -64,6 +64,7 @@ def add_to_interview_database(candidate: dict, page: dict, stage5_score: int | N
         "LinkedIn": {"url": candidate.get("linkedin")},
         "Interview Status": {"select": {"name": "Pending"}},
         "Source Page": {"url": f"https://www.notion.so/{candidate['page_id'].replace('-', '')}"},
+        "Application": {"relation": [{"id": candidate["page_id"]}]},
     }
 
     # Add scores (skip None values)
