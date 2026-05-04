@@ -58,7 +58,7 @@ The webhook solves this by detecting orphan submissions, matching them back to t
 | 2 — Systems Competency | Notion pipeline, Google Sheets, Slides, AI email (screenshots) | Claude vision, `/20` | 12+ |
 | 3 — Sales Process | Executive sales simulation (text) | Claude text, `/35` | 22+ |
 | 4 — Marketing Outreach | Cold outreach artefacts (text) | Claude text, `/25` | 15+ |
-| 5 — Bitcoin Task | On-chain + Lightning payment with screenshots | Automated verification, `/6` | 4+ |
+| 5 — Bitcoin Task | On-chain + Lightning payment, blockchain-verified | mempool.space + Blink API (4pt deterministic) + Claude vision on screenshots (2pt backup), `/6` | 4+ |
 
 Thresholds and composite weights live in [`config/head_of_sales.yaml`](config/head_of_sales.yaml).
 
