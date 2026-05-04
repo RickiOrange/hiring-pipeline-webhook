@@ -65,10 +65,14 @@ def evaluate_with_images(
     text_content: str = "",
     model: str = DEFAULT_MODEL,
 ) -> dict:
-    """Send a prompt with images to Claude for visual evaluation. Returns parsed JSON."""
-    content = []
+    """Send a prompt with images to Claude for visual evaluation. Returns parsed JSON.
 
-    # Add images first
+    Never raises on transport/API errors — returns `{"_api_error": ...}` so callers
+    can degrade gracefully (e.g. fall back to non-visual scoring).
+    """
+    content = []
+    image_errors = []
+
     for url in image_urls:
         if not url:
             continue
@@ -84,9 +88,9 @@ def evaluate_with_images(
                     },
                 })
         except Exception as e:
+            image_errors.append(str(e))
             content.append({"type": "text", "text": f"[Failed to load image: {e}]"})
 
-    # Add the text prompt
     full_prompt = prompt
     if text_content:
         full_prompt += f"\n\nADDITIONAL TEXT CONTENT:\n{text_content}"
@@ -95,19 +99,33 @@ def evaluate_with_images(
     if not content:
         return {"score": 0, "decision": "Fail", "reasoning": "No content to evaluate"}
 
-    message = CLIENT.messages.create(
-        model=model,
-        max_tokens=3000,
-        temperature=0,
-        messages=[{"role": "user", "content": content}],
-    )
+    try:
+        message = CLIENT.messages.create(
+            model=model,
+            max_tokens=3000,
+            temperature=0,
+            messages=[{"role": "user", "content": content}],
+        )
+    except Exception as e:
+        return {"_api_error": str(e), "_image_errors": image_errors}
 
     response_text = message.content[0].text
-    return _parse_json_response(response_text)
+    parsed = _parse_json_response(response_text)
+    if image_errors:
+        parsed["_image_errors"] = image_errors
+    return parsed
+
+
+# Anthropic rejects images whose base64 payload exceeds 5 MB. Base64 inflates
+# raw bytes by ~33 %, so we keep the raw bytes under ~3.7 MB.
+_MAX_IMAGE_RAW_BYTES = 3_700_000
 
 
 def _download_image(url: str) -> dict | None:
-    """Download an image from URL and return base64 data with media type."""
+    """Download an image from URL and return base64 data with media type.
+
+    Oversized images are downscaled with Pillow to fit Anthropic's 5 MB limit.
+    """
     import base64
     if not url:
         return None
@@ -115,7 +133,6 @@ def _download_image(url: str) -> dict | None:
         resp = client.get(url)
         resp.raise_for_status()
         content_type = resp.headers.get("content-type", "image/png")
-        # Normalize media type
         if "jpeg" in content_type or "jpg" in content_type:
             media_type = "image/jpeg"
         elif "png" in content_type:
@@ -125,9 +142,47 @@ def _download_image(url: str) -> dict | None:
         elif "webp" in content_type:
             media_type = "image/webp"
         else:
-            media_type = "image/png"  # default
-        data = base64.standard_b64encode(resp.content).decode("utf-8")
+            media_type = "image/png"
+        raw_bytes = resp.content
+        if len(raw_bytes) > _MAX_IMAGE_RAW_BYTES:
+            try:
+                raw_bytes, media_type = _shrink_image(raw_bytes)
+            except Exception as e:
+                print(f"  WARN: image downscale failed ({e}); sending oversized blob — API may reject it")
+        data = base64.standard_b64encode(raw_bytes).decode("utf-8")
         return {"media_type": media_type, "data": data}
+
+
+def _shrink_image(raw_bytes: bytes) -> tuple[bytes, str]:
+    """Recompress an oversized image to fit under the Anthropic size limit.
+
+    Iteratively reduces JPEG quality and dimensions until the payload is small
+    enough. Returns (new_bytes, media_type).
+    """
+    from io import BytesIO
+    from PIL import Image
+
+    img = Image.open(BytesIO(raw_bytes))
+    if img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+
+    max_dim = 2048
+    quality = 85
+    while True:
+        out = img.copy()
+        out.thumbnail((max_dim, max_dim))
+        buf = BytesIO()
+        out.save(buf, format="JPEG", quality=quality, optimize=True)
+        if buf.tell() <= _MAX_IMAGE_RAW_BYTES:
+            print(f"  Downscaled image: {len(raw_bytes):,} -> {buf.tell():,} bytes (max_dim={max_dim}, q={quality})")
+            return buf.getvalue(), "image/jpeg"
+        if quality > 60:
+            quality -= 10
+        elif max_dim > 800:
+            max_dim = int(max_dim * 0.75)
+        else:
+            print(f"  WARN: image still {buf.tell():,} bytes after max compression; sending anyway")
+            return buf.getvalue(), "image/jpeg"
 
 
 def fetch_all_file_urls(files_value: str | None) -> list[str]:

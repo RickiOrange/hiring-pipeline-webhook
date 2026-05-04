@@ -1207,31 +1207,41 @@ def _build_blockchain_context(
     return "\n".join(lines)
 
 
-def _determine_stage5_result(ai_result: dict) -> tuple[str, int]:
-    """Extract score and pass/fail from the AI's 6-point rubric evaluation.
+def _score_stage5_blockchain(
+    onchain_data: dict,
+    lightning_data: dict,
+    txid: str | None,
+    payment_hash: str | None,
+    onchain_amount_match: dict | None,
+    lightning_amount_match: dict | None,
+    claimed_onchain_sats: int | None,
+    claimed_lightning_sats: int | None,
+) -> dict:
+    """Compute the 4 deterministic Stage 5 rubric items from blockchain APIs.
 
-    Returns (decision, score) tuple.
+    Primary verification path — does not depend on AI / screenshot interpretation.
     """
-    score = ai_result.get("score", 0)
-    if not isinstance(score, int):
-        try:
-            score = int(score)
-        except (ValueError, TypeError):
-            score = 0
+    return {
+        "onchain_txid": 1 if (txid and onchain_data.get("txid_match")) else 0,
+        "onchain_amount": 1 if (claimed_onchain_sats and onchain_amount_match and onchain_amount_match.get("matched")) else 0,
+        "lightning_hash": 1 if (payment_hash and lightning_data.get("hash_match")) else 0,
+        "lightning_amount": 1 if (claimed_lightning_sats and lightning_amount_match and lightning_amount_match.get("matched")) else 0,
+    }
 
-    # Fraud override
-    if ai_result.get("fraud_flag"):
+
+def _determine_stage5_result(item_scores: dict, fraud_flag: bool = False) -> tuple[str, int]:
+    """Sum a 6-item rubric and apply the pass threshold.
+
+    Items: onchain_screenshot, onchain_txid, onchain_amount,
+           lightning_screenshot, lightning_hash, lightning_amount (1 pt each).
+    """
+    if fraud_flag:
         return "Fail", 0
-
-    decision = ai_result.get("decision", "Fail")
-    if decision not in ("Pass", "Fail"):
-        decision = "Pass" if score >= 4 else "Fail"
-
-    # Enforce threshold regardless of AI decision
-    if score < 4:
-        decision = "Fail"
-
-    return decision, score
+    score = sum(int(bool(item_scores.get(k))) for k in (
+        "onchain_screenshot", "onchain_txid", "onchain_amount",
+        "lightning_screenshot", "lightning_hash", "lightning_amount",
+    ))
+    return ("Pass" if score >= 4 else "Fail"), score
 
 
 def run_stage5(config: dict) -> dict:
@@ -1348,7 +1358,14 @@ def run_stage5(config: dict) -> dict:
             else:
                 print(f"  Lightning amount match: {claimed_lightning_sats} sats NOT found")
 
-        # Build context and evaluate with AI
+        # PRIMARY: deterministic 4-point score from mempool.space + Blink data.
+        # Screenshots are a backup signal worth at most 2/6, scored by AI below.
+        item_scores = _score_stage5_blockchain(
+            onchain_data, lightning_data, txid, payment_hash,
+            onchain_amount_match, lightning_amount_match,
+            claimed_onchain_sats, claimed_lightning_sats,
+        )
+
         blockchain_context = _build_blockchain_context(
             onchain_data, lightning_data, txid, payment_hash,
             onchain_amount_match=onchain_amount_match,
@@ -1356,29 +1373,57 @@ def run_stage5(config: dict) -> dict:
             claimed_onchain_sats=claimed_onchain_sats,
             claimed_lightning_sats=claimed_lightning_sats,
         )
+
+        # SECONDARY: AI scores the two screenshot items only. Failure here costs
+        # at most 2/6 — the deterministic 4 points are unaffected.
         all_images = (btc_screenshots or []) + (ln_screenshots or [])
+        ai_reasoning = ""
+        ai_notes = ""
+        ai_error = None
+        fraud_flag = False
+        item_scores["onchain_screenshot"] = 0
+        item_scores["lightning_screenshot"] = 0
 
         if all_images:
-            result = evaluate_with_images(
+            ai_result = evaluate_with_images(
                 prompt=stage5_prompt,
                 image_urls=all_images,
                 text_content=blockchain_context,
             )
-        else:
-            # No screenshots — evaluate with blockchain data only
-            result = evaluate_candidate(candidate, stage5_prompt, submission_text=blockchain_context)
+            if ai_result.get("_api_error"):
+                ai_error = ai_result["_api_error"]
+                print(f"  Screenshot AI scoring failed (non-blocking): {ai_error[:200]}")
+            else:
+                ai_item_scores = ai_result.get("item_scores", {}) or {}
+                item_scores["onchain_screenshot"] = 1 if ai_item_scores.get("onchain_screenshot") else 0
+                item_scores["lightning_screenshot"] = 1 if ai_item_scores.get("lightning_screenshot") else 0
+                ai_reasoning = ai_result.get("reasoning", "") or ""
+                ai_notes = ai_result.get("notes", "") or ""
+                # Only honour the fraud flag when blockchain shows zero activity —
+                # otherwise verified on-chain data overrides screenshot suspicion.
+                if ai_result.get("fraud_flag") and not onchain_data.get("verified") and not lightning_data.get("verified"):
+                    fraud_flag = True
 
-        # Determine final result from 6-point rubric
-        final_result, score = _determine_stage5_result(result)
+        final_result, score = _determine_stage5_result(item_scores, fraud_flag=fraud_flag)
 
-        # Build detailed reasoning
-        reasoning = result.get("reasoning", "")
-        item_scores = result.get("item_scores", {})
-        if item_scores:
-            breakdown = ", ".join(f"{k}={v}" for k, v in item_scores.items())
-            reasoning += f"\n[ITEM SCORES] {breakdown}"
-        if result.get("fraud_flag"):
-            reasoning += "\n[FRAUD FLAG] Screenshots appear fabricated — blockchain data shows no matching transactions."
+        breakdown = ", ".join(f"{k}={v}" for k, v in item_scores.items())
+        reasoning_parts = []
+        if ai_reasoning:
+            reasoning_parts.append(ai_reasoning)
+        reasoning_parts.append(f"[ITEM SCORES] {breakdown}")
+        reasoning_parts.append(
+            f"[BLOCKCHAIN] on-chain verified={bool(onchain_data.get('verified'))}, "
+            f"txid_match={onchain_data.get('txid_match')}, "
+            f"lightning verified={bool(lightning_data.get('verified'))}, "
+            f"hash_match={lightning_data.get('hash_match')}"
+        )
+        if ai_error:
+            reasoning_parts.append(f"[SCREENSHOT AI ERROR] {ai_error[:300]} — blockchain points still counted.")
+        if ai_notes:
+            reasoning_parts.append(f"[NOTES] {ai_notes}")
+        if fraud_flag:
+            reasoning_parts.append("[FRAUD FLAG] Screenshots appear fabricated — blockchain data shows no matching transactions.")
+        reasoning = "\n".join(reasoning_parts)
 
         update_candidate(candidate["page_id"], {
             "Stage 5 Result": final_result,
